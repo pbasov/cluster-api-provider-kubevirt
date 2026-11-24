@@ -309,6 +309,15 @@ func TestReconcileClaimsInvalid(t *testing.T) {
 				return []client.Object{claim}
 			},
 		},
+		{
+			name:    "claim from another pool than spec.network references",
+			network: lanNetwork(1),
+			objects: func(kvm *infrav1.KubevirtMachine) []client.Object {
+				claim := boundClaim(kvm, "test-machine-lan-0")
+				claim.Spec.PoolRef.Name = "previous-pool"
+				return []client.Object{claim}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -329,23 +338,40 @@ func TestReconcileClaimsInvalid(t *testing.T) {
 }
 
 func TestReleaseClaims(t *testing.T) {
-	g := NewWithT(t)
-	kvm := newKubevirtMachine("", lanNetwork(2))
-	foreign := boundClaim(kvm, "test-machine-lan-1")
-	foreign.OwnerReferences[0].UID = "other-uid"
-	c := fake.NewClientBuilder().WithScheme(testScheme(g)).WithObjects(
-		kvm, boundClaim(kvm, "test-machine-lan-0"), foreign,
-	).Build()
+	// Claims are released by ownership, so the ones spec.network no longer lists do not leak.
+	for name, network := range map[string]*infrav1.NetworkSpec{
+		"interface still in spec.network":   lanNetwork(1),
+		"interface gone from spec.network":  {Interfaces: []infrav1.NetworkInterfaceSpec{{Name: "other", AddressesFromPools: []corev1.TypedLocalObjectReference{poolRef()}}}},
+		"spec.network removed after claims": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			kvm := newKubevirtMachine("", network)
+			foreign := boundClaim(kvm, "other-machine-lan-0")
+			foreign.OwnerReferences[0].UID = "other-uid"
+			c := fake.NewClientBuilder().WithScheme(testScheme(g)).WithObjects(
+				kvm, boundClaim(kvm, "test-machine-lan-0"), boundClaim(kvm, "test-machine-removed-0"), foreign,
+			).Build()
 
-	g.Expect(ReleaseClaims(gocontext.Background(), c, kvm)).To(Succeed())
+			claims, err := OwnedClaims(gocontext.Background(), c, kvm)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(claims).To(HaveLen(2))
+			g.Expect(ReleaseClaims(gocontext.Background(), c, claims)).To(Succeed())
 
-	err := c.Get(gocontext.Background(), client.ObjectKey{Namespace: testNamespace, Name: "test-machine-lan-0"}, &ipamv1.IPAddressClaim{})
-	g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "own claim released")
+			for _, released := range []string{"test-machine-lan-0", "test-machine-removed-0"} {
+				err := c.Get(gocontext.Background(), client.ObjectKey{Namespace: testNamespace, Name: released}, &ipamv1.IPAddressClaim{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "own claim %s released", released)
+			}
 
-	kept := &ipamv1.IPAddressClaim{}
-	g.Expect(c.Get(gocontext.Background(), client.ObjectKeyFromObject(foreign), kept)).To(Succeed(), "claim controlled by another object left alone")
-	g.Expect(kept.Finalizers).To(ContainElement(ClaimProtectionFinalizer))
+			kept := &ipamv1.IPAddressClaim{}
+			g.Expect(c.Get(gocontext.Background(), client.ObjectKeyFromObject(foreign), kept)).To(Succeed(), "claim controlled by another object left alone")
+			g.Expect(kept.Finalizers).To(ContainElement(ClaimProtectionFinalizer))
 
-	// Releasing again is a no-op.
-	g.Expect(ReleaseClaims(gocontext.Background(), c, kvm)).To(Succeed())
+			// Releasing again is a no-op.
+			claims, err = OwnedClaims(gocontext.Background(), c, kvm)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(claims).To(BeEmpty())
+			g.Expect(ReleaseClaims(gocontext.Background(), c, claims)).To(Succeed())
+		})
+	}
 }

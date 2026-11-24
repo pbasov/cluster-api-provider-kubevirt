@@ -690,21 +690,29 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		}
 	}
 
-	if ctx.KubevirtMachine.Spec.Network != nil && !r.IPAMEnabled {
+	if r.IPAMEnabled {
+		// The claims are found by ownership rather than from spec.network, so that none is left
+		// behind for a spec.network changed before the field was made immutable.
+		claims, err := ipam.OwnedClaims(ctx, r.Client, ctx.KubevirtMachine)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+		}
+		if len(claims) > 0 {
+			// Keep the claimed addresses until the VM that uses them is gone, so that a
+			// replacement machine can never be handed an address that is still in use.
+			if externalMachine.Exists() {
+				ctx.Logger.Info("Waiting for the VM to be deleted before releasing its IP addresses...")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			ctx.Logger.Info("Releasing IP addresses...")
+			if err := ipam.ReleaseClaims(ctx, r.Client, claims); err != nil {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to release IP address claims")
+			}
+		}
+	} else if ctx.KubevirtMachine.Spec.Network != nil {
 		// Without the gate there is neither the RBAC nor, possibly, the API to touch claims. A
 		// machine admitted while the gate is disabled never had any.
 		ctx.Logger.Info("The KubevirtIPAM feature gate is disabled, not releasing IP address claims of spec.network")
-	} else if ctx.KubevirtMachine.Spec.Network != nil {
-		// Keep the claimed addresses until the VM that uses them is gone, so that a
-		// replacement machine can never be handed an address that is still in use.
-		if externalMachine.Exists() {
-			ctx.Logger.Info("Waiting for the VM to be deleted before releasing its IP addresses...")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		ctx.Logger.Info("Releasing IP addresses...")
-		if err := ipam.ReleaseClaims(ctx, r.Client, ctx.KubevirtMachine); err != nil {
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to release IP address claims")
-		}
 	}
 
 	// Machine is deleted so remove the finalizer.

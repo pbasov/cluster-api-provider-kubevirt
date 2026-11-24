@@ -65,15 +65,20 @@ type KubevirtMachineSpec struct {
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
 
 	// Network configures static addressing of the virtual machine's interfaces from
-	// Cluster API IPAM pools. For every interface listed here the controller creates one
-	// IPAddressClaim per pool, waits for the resulting IPAddress, pins a MAC address
-	// derived from that address on the interface (unless the template sets one) and
-	// renders a static network configuration for the guest, in the format of the cloud-init
-	// data source selected by spec.cloudInit.dataSource (config drive by default), so the
-	// guest needs no DHCP. The configuration is stored in a per-machine Secret and delivered
-	// the same way as spec.cloudInit.networkDataSecretRef. The claimed addresses are also
-	// reported in status.addresses, without relying on the guest agent.
+	// Cluster API IPAM pools. It requires the KubevirtIPAM feature gate of the provider;
+	// with the gate disabled a KubevirtMachine with network is not provisioned.
+	// For every interface listed here the controller creates one IPAddressClaim per pool,
+	// waits for the resulting IPAddress, pins a MAC address derived from that address on
+	// the interface (unless the template sets one) and renders a static network
+	// configuration for the guest, in the format of the cloud-init data source selected by
+	// spec.cloudInit.dataSource (config drive by default), so the guest needs no DHCP. The
+	// configuration is stored in the Secret "<KubevirtMachine name>-networkdata" next to the
+	// virtual machine in the infra cluster. The claimed addresses are also reported in
+	// status.addresses, without relying on the guest agent. The claims are released when the
+	// KubevirtMachine is deleted, once its virtual machine is gone.
 	// It cannot be combined with spec.cloudInit.networkData or networkDataSecretRef.
+	// Network data is applied during the VM's first boot, so this field's presence and value
+	// are immutable on KubevirtMachine after creation.
 	// When unset, interfaces are configured the way the guest and the virtual machine
 	// template decide.
 	// +optional
@@ -284,6 +289,8 @@ type KubevirtMachineStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready",description="Is machine ready"
 // +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.cloudInit)) == (has(oldSelf.spec) && has(oldSelf.spec.cloudInit))",message="CloudInit presence is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.cloudInit) || !has(oldSelf.spec) || !has(oldSelf.spec.cloudInit) || self.spec.cloudInit == oldSelf.spec.cloudInit",message="CloudInit is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.network)) == (has(oldSelf.spec) && has(oldSelf.spec.network))",message="Network presence is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.network) || !has(oldSelf.spec) || !has(oldSelf.spec.network) || self.spec.network == oldSelf.spec.network",message="Network is immutable"
 
 // KubevirtMachine is the Schema for the kubevirtmachines API.
 type KubevirtMachine struct {

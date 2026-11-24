@@ -149,7 +149,11 @@ func ReconcileClaims(ctx gocontext.Context, c client.Client, kubevirtMachine *in
 
 		bound := true
 		for i, poolRef := range ifaceSpec.AddressesFromPools {
-			claim, err := ensureClaim(ctx, c, kubevirtMachine, clusterName, ClaimName(kubevirtMachine.Name, ifaceSpec.Name, i), poolRef.Kind, poolRef.Name, poolRef.APIGroup)
+			pool := ipamv1.IPPoolReference{Kind: poolRef.Kind, Name: poolRef.Name}
+			if poolRef.APIGroup != nil {
+				pool.APIGroup = *poolRef.APIGroup
+			}
+			claim, err := ensureClaim(ctx, c, kubevirtMachine, clusterName, ClaimName(kubevirtMachine.Name, ifaceSpec.Name, i), pool)
 			if err != nil {
 				return nil, err
 			}
@@ -187,16 +191,12 @@ func ReconcileClaims(ctx gocontext.Context, c client.Client, kubevirtMachine *in
 	return result, nil
 }
 
-func ensureClaim(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav1.KubevirtMachine, clusterName, name, kind, poolName string, apiGroup *string) (*ipamv1.IPAddressClaim, error) {
+func ensureClaim(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav1.KubevirtMachine, clusterName, name string, poolRef ipamv1.IPPoolReference) (*ipamv1.IPAddressClaim, error) {
 	claim := &ipamv1.IPAddressClaim{}
 	key := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: name}
 	err := c.Get(ctx, key, claim)
 	switch {
 	case apierrors.IsNotFound(err):
-		group := ""
-		if apiGroup != nil {
-			group = *apiGroup
-		}
 		claim = &ipamv1.IPAddressClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:       name,
@@ -206,11 +206,7 @@ func ensureClaim(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav
 			},
 			Spec: ipamv1.IPAddressClaimSpec{
 				ClusterName: clusterName,
-				PoolRef: ipamv1.IPPoolReference{
-					APIGroup: group,
-					Kind:     kind,
-					Name:     poolName,
-				},
+				PoolRef:     poolRef,
 			},
 		}
 		if err := controllerutil.SetControllerReference(kubevirtMachine, claim, c.Scheme()); err != nil {
@@ -226,6 +222,11 @@ func ensureClaim(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav
 
 	if !metav1.IsControlledBy(claim, kubevirtMachine) {
 		return nil, invalidf("IPAddressClaim %s exists but is not controlled by KubevirtMachine %s", key, kubevirtMachine.Name)
+	}
+	if claim.Spec.PoolRef != poolRef {
+		// spec.network is immutable; this is a KubevirtMachine changed before that was enforced.
+		return nil, invalidf("IPAddressClaim %s claims from %s %s/%s, but spec.network references %s %s/%s; spec.network cannot be changed, replace the machine instead",
+			key, claim.Spec.PoolRef.Kind, claim.Spec.PoolRef.APIGroup, claim.Spec.PoolRef.Name, poolRef.Kind, poolRef.APIGroup, poolRef.Name)
 	}
 	if !controllerutil.ContainsFinalizer(claim, ClaimProtectionFinalizer) {
 		patch := client.MergeFrom(claim.DeepCopy())
@@ -275,39 +276,41 @@ func readAddress(ctx gocontext.Context, c client.Client, claim *ipamv1.IPAddress
 	return addr, nil
 }
 
-// ReleaseClaims removes the ClaimProtectionFinalizer from, and deletes, every IPAddressClaim of
-// spec.network of the KubevirtMachine, which returns the addresses to their pools. Call it only
-// once the virtual machine using the addresses is gone.
-func ReleaseClaims(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav1.KubevirtMachine) error {
-	network := kubevirtMachine.Spec.Network
-	if network == nil {
-		return nil
+// OwnedClaims returns the IPAddressClaims controlled by the KubevirtMachine. It goes by ownership,
+// not by spec.network, so that it also finds the claims of entries removed from spec.network
+// before the field was made immutable.
+func OwnedClaims(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav1.KubevirtMachine) ([]ipamv1.IPAddressClaim, error) {
+	claims := &ipamv1.IPAddressClaimList{}
+	if err := c.List(ctx, claims, client.InNamespace(kubevirtMachine.Namespace)); err != nil {
+		return nil, errors.Wrapf(err, "failed to list IPAddressClaims in namespace %s", kubevirtMachine.Namespace)
 	}
 
-	for _, ifaceSpec := range network.Interfaces {
-		for i := range ifaceSpec.AddressesFromPools {
-			claim := &ipamv1.IPAddressClaim{}
-			key := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: ClaimName(kubevirtMachine.Name, ifaceSpec.Name, i)}
-			if err := c.Get(ctx, key, claim); err != nil {
-				if apierrors.IsNotFound(err) {
-					continue
-				}
-				return errors.Wrapf(err, "failed to get IPAddressClaim %s", key)
+	var owned []ipamv1.IPAddressClaim
+	for i := range claims.Items {
+		if metav1.IsControlledBy(&claims.Items[i], kubevirtMachine) {
+			owned = append(owned, claims.Items[i])
+		}
+	}
+	return owned, nil
+}
+
+// ReleaseClaims removes the ClaimProtectionFinalizer from, and deletes, the IPAddressClaims, which
+// returns the addresses to their pools. Call it only once the virtual machine using the addresses
+// is gone.
+func ReleaseClaims(ctx gocontext.Context, c client.Client, claims []ipamv1.IPAddressClaim) error {
+	for i := range claims {
+		claim := &claims[i]
+		key := client.ObjectKeyFromObject(claim)
+		if controllerutil.ContainsFinalizer(claim, ClaimProtectionFinalizer) {
+			patch := client.MergeFrom(claim.DeepCopy())
+			controllerutil.RemoveFinalizer(claim, ClaimProtectionFinalizer)
+			if err := c.Patch(ctx, claim, patch); err != nil && !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "failed to remove finalizer from IPAddressClaim %s", key)
 			}
-			if !metav1.IsControlledBy(claim, kubevirtMachine) {
-				continue
-			}
-			if controllerutil.ContainsFinalizer(claim, ClaimProtectionFinalizer) {
-				patch := client.MergeFrom(claim.DeepCopy())
-				controllerutil.RemoveFinalizer(claim, ClaimProtectionFinalizer)
-				if err := c.Patch(ctx, claim, patch); err != nil && !apierrors.IsNotFound(err) {
-					return errors.Wrapf(err, "failed to remove finalizer from IPAddressClaim %s", key)
-				}
-			}
-			if claim.DeletionTimestamp.IsZero() {
-				if err := c.Delete(ctx, claim); err != nil && !apierrors.IsNotFound(err) {
-					return errors.Wrapf(err, "failed to delete IPAddressClaim %s", key)
-				}
+		}
+		if claim.DeletionTimestamp.IsZero() {
+			if err := c.Delete(ctx, claim); err != nil && !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "failed to delete IPAddressClaim %s", key)
 			}
 		}
 	}

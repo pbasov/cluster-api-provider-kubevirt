@@ -390,6 +390,20 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(kubevirtMachine.Finalizers).NotTo(ContainElement(infrav1.MachineFinalizer))
 	})
 
+	It("releases the claims it owns even when spec.network no longer lists them", func() {
+		// A KubevirtMachine whose spec.network was removed before the field became immutable.
+		claims := boundClaimAndAddress(kubevirtMachine, "192.0.2.10")
+		kubevirtMachine.Spec.Network = nil
+		setup(claims...)
+
+		out, err := reconciler.reconcileDelete(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{}))
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: claimName}, &ipamv1.IPAddressClaim{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		Expect(kubevirtMachine.Finalizers).NotTo(ContainElement(infrav1.MachineFinalizer))
+	})
+
 	It("writes only the userdata when spec.network is unset", func() {
 		kubevirtMachine.Spec.Network = nil
 		setup()

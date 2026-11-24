@@ -157,6 +157,90 @@ spec:
                             type: string
                         type: object
                         x-kubernetes-map-type: atomic
+                      network:
+                        description: |-
+                          Network configures static addressing of the virtual machine's interfaces from
+                          Cluster API IPAM pools. For every interface listed here the controller creates one
+                          IPAddressClaim per pool, waits for the resulting IPAddress, pins a MAC address
+                          derived from that address on the interface (unless the template sets one) and
+                          renders a static network configuration for the guest, in the format of the cloud-init
+                          data source selected by spec.cloudInit.dataSource (config drive by default), so the
+                          guest needs no DHCP. The configuration is stored in a per-machine Secret and delivered
+                          the same way as spec.cloudInit.networkDataSecretRef. The claimed addresses are also
+                          reported in status.addresses, without relying on the guest agent.
+                          It cannot be combined with spec.cloudInit.networkData or networkDataSecretRef.
+                          When unset, interfaces are configured the way the guest and the virtual machine
+                          template decide.
+                        properties:
+                          interfaces:
+                            description: |-
+                              Interfaces lists the interfaces of the virtual machine template that get their
+                              addresses from IPAM pools.
+                            items:
+                              description: NetworkInterfaceSpec defines the addressing
+                                of one interface of the virtual machine.
+                              properties:
+                                addressesFromPools:
+                                  description: |-
+                                    AddressesFromPools references the IPAM pools to claim addresses from, one address
+                                    per pool. The first claimed address that has a gateway provides the default route.
+                                    Only IPv4 pools are supported.
+                                  items:
+                                    description: |-
+                                      TypedLocalObjectReference contains enough information to let you locate the
+                                      typed referenced object inside the same namespace.
+                                    properties:
+                                      apiGroup:
+                                        description: |-
+                                          APIGroup is the group for the resource being referenced.
+                                          If APIGroup is not specified, the specified Kind must be in the core API group.
+                                          For any other third-party types, APIGroup is required.
+                                        type: string
+                                      kind:
+                                        description: Kind is the type of resource
+                                          being referenced
+                                        type: string
+                                      name:
+                                        description: Name is the name of resource
+                                          being referenced
+                                        type: string
+                                    required:
+                                    - kind
+                                    - name
+                                    type: object
+                                    x-kubernetes-map-type: atomic
+                                  minItems: 1
+                                  type: array
+                                mtu:
+                                  description: MTU is the MTU configured on the interface
+                                    in the guest.
+                                  format: int32
+                                  minimum: 68
+                                  type: integer
+                                name:
+                                  description: |-
+                                    Name is the name of the interface in
+                                    spec.virtualMachineTemplate.spec.template.spec.domain.devices.interfaces.
+                                  minLength: 1
+                                  type: string
+                                nameservers:
+                                  description: Nameservers is a list of DNS servers
+                                    configured in the guest.
+                                  items:
+                                    type: string
+                                  type: array
+                              required:
+                              - addressesFromPools
+                              - name
+                              type: object
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                        required:
+                        - interfaces
+                        type: object
                       providerID:
                         description: ProviderID TBD what to use for Kubevirt
                         type: string
@@ -4916,6 +5000,11 @@ spec:
                             type: object
                         type: object
                     type: object
+                    x-kubernetes-validations:
+                    - message: network cannot be combined with cloudInit.networkData
+                        or cloudInit.networkDataSecretRef
+                      rule: '!has(self.network) || !has(self.cloudInit) || (!has(self.cloudInit.networkData)
+                        && !has(self.cloudInit.networkDataSecretRef))'
                 required:
                 - spec
                 type: object

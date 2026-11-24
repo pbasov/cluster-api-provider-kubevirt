@@ -147,12 +147,12 @@ func buildVirtualMachineInstanceTemplate(ctx *context.MachineContext) *kubevirtv
 	cloudInitSecretName := *ctx.Machine.Spec.Bootstrap.DataSecretName + "-userdata"
 	userDataSecretRef := &corev1.LocalObjectReference{Name: cloudInitSecretName}
 
-	// The network data is copied into the same secret as the user data. KubeVirt mounts each
-	// reference into its own pod volume, so pointing both references at one secret is safe.
+	// The network data lives in a secret of its own per machine, not in the user data secret:
+	// machines may share a bootstrap data secret, and with it the user data secret, while each
+	// of them needs its own network data.
 	var networkDataSecretRef *corev1.LocalObjectReference
-	if ctx.KubevirtMachine.Spec.CloudInit.GetNetworkDataSecretRef() != nil || ctx.KubevirtMachine.Spec.CloudInit.GetNetworkData() != nil ||
-		ctx.KubevirtMachine.Spec.Network != nil {
-		networkDataSecretRef = &corev1.LocalObjectReference{Name: cloudInitSecretName}
+	if HasNetworkData(ctx.KubevirtMachine) {
+		networkDataSecretRef = &corev1.LocalObjectReference{Name: NetworkDataSecretName(ctx.KubevirtMachine.Name)}
 	}
 
 	// The configuration rendered from spec.network matches the interfaces by MAC address, so
@@ -197,6 +197,19 @@ func nodeRole(ctx *context.MachineContext) string {
 		return constants.ControlPlaneNodeRoleValue
 	}
 	return constants.WorkerNodeRoleValue
+}
+
+// NetworkDataSecretName returns the name of the secret, in the namespace of the virtual machine
+// in the infra cluster, that holds the cloud-init network data of a KubevirtMachine.
+func NetworkDataSecretName(kubevirtMachineName string) string {
+	return kubevirtMachineName + "-networkdata"
+}
+
+// HasNetworkData tells whether the virtual machine of a KubevirtMachine gets cloud-init network
+// data, from spec.cloudInit.networkData, spec.cloudInit.networkDataSecretRef or spec.network.
+func HasNetworkData(kubevirtMachine *infrav1.KubevirtMachine) bool {
+	cloudInit := kubevirtMachine.Spec.CloudInit
+	return cloudInit.GetNetworkData() != nil || cloudInit.GetNetworkDataSecretRef() != nil || kubevirtMachine.Spec.Network != nil
 }
 
 // pinInterfaceMACAddresses sets the MAC address of every interface that has a static

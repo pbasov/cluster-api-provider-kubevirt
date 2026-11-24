@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -53,8 +54,14 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		infraClusterMock *infraclustermock.MockInfraCluster
 		machineContext   *context.MachineContext
 		reconciler       KubevirtMachineReconciler
-		c                client.Client
+		// c is the management cluster client.
+		c client.Client
+		// infraClient is the infra cluster client; it is c unless the test sets up an external
+		// infra cluster.
+		infraClient client.Client
 	)
+
+	lanPool := ipamv1.IPPoolReference{APIGroup: "ipam.cluster.x-k8s.io", Kind: "InClusterIPPool", Name: "pool"}
 
 	BeforeEach(func() {
 		mockCtrl := gomock.NewController(GinkgoT())
@@ -74,13 +81,9 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		}}
 		kubevirtMachine.Spec.Network = &infrav1.NetworkSpec{
 			Interfaces: []infrav1.NetworkInterfaceSpec{{
-				Name: "lan",
-				AddressesFromPools: []corev1.TypedLocalObjectReference{{
-					APIGroup: ptr.To("ipam.cluster.x-k8s.io"),
-					Kind:     "InClusterIPPool",
-					Name:     "pool",
-				}},
-				Nameservers: []string{"192.0.2.53"},
+				Name:               "lan",
+				AddressesFromPools: []corev1.TypedLocalObjectReference{{APIGroup: ptr.To(lanPool.APIGroup), Kind: lanPool.Kind, Name: lanPool.Name}},
+				Nameservers:        []string{"192.0.2.53"},
 			}},
 		}
 
@@ -100,53 +103,94 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		}
 	})
 
-	setup := func(objects ...client.Object) {
-		objects = append([]client.Object{cluster, kubevirtCluster, machine, kubevirtMachine, sshKeySecret, bootstrapSecret}, objects...)
-		c = fake.NewClientBuilder().WithScheme(testing.SetupScheme()).WithObjects(objects...).WithStatusSubresource(objects...).Build()
-		machineContext = &context.MachineContext{
+	newMachineContext := func(m *clusterv1.Machine, kvm *infrav1.KubevirtMachine) *context.MachineContext {
+		return &context.MachineContext{
 			Context:         logr.NewContext(gocontext.Background(), GinkgoLogr),
 			Cluster:         cluster,
 			KubevirtCluster: kubevirtCluster,
-			Machine:         machine,
-			KubevirtMachine: kubevirtMachine,
+			Machine:         m,
+			KubevirtMachine: kvm,
 			Logger:          ctrl.Log.WithName("test"),
 		}
+	}
+
+	// setupWithInfraClient builds the management cluster client from objects and uses infra as the
+	// infra cluster client, or the management cluster client when infra is nil.
+	setupWithInfraClient := func(infra client.Client, objects ...client.Object) {
+		objects = append([]client.Object{cluster, kubevirtCluster, machine, kubevirtMachine, sshKeySecret, bootstrapSecret}, objects...)
+		c = fake.NewClientBuilder().WithScheme(testing.SetupScheme()).WithObjects(objects...).WithStatusSubresource(objects...).Build()
+		infraClient = infra
+		if infraClient == nil {
+			infraClient = c
+		}
+		machineContext = newMachineContext(machine, kubevirtMachine)
 		reconciler = KubevirtMachineReconciler{
 			Client:          c,
 			InfraCluster:    infraClusterMock,
 			WorkloadCluster: workloadclustermock.NewMockWorkloadCluster(gomock.NewController(GinkgoT())),
 			MachineFactory:  kubevirt.DefaultMachineFactory{},
 		}
-		infraClusterMock.EXPECT().GenerateInfraClusterClient(gomock.Any(), gomock.Any(), gomock.Any()).Return(c, kubevirtMachine.Namespace, nil).AnyTimes()
+		infraClusterMock.EXPECT().GenerateInfraClusterClient(gomock.Any(), gomock.Any(), gomock.Any()).Return(infraClient, kubevirtMachine.Namespace, nil).AnyTimes()
 	}
 
-	boundClaimAndAddress := func() []client.Object {
+	setup := func(objects ...client.Object) {
+		setupWithInfraClient(nil, objects...)
+	}
+
+	// boundClaimAndAddress returns the IPAddressClaim of the lan interface of kvm, bound to an
+	// IPAddress with the given address.
+	boundClaimAndAddress := func(kvm *infrav1.KubevirtMachine, address string) []client.Object {
+		name := ipam.ClaimName(kvm.Name, "lan", 0)
 		claim := &ipamv1.IPAddressClaim{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:       claimName,
+				Name:       name,
 				Finalizers: []string{ipam.ClaimProtectionFinalizer},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: infrav1.GroupVersion.String(),
 					Kind:       "KubevirtMachine",
-					Name:       kubevirtMachine.Name,
-					UID:        kubevirtMachine.UID,
+					Name:       kvm.Name,
+					UID:        kvm.UID,
 					Controller: ptr.To(true),
 				}},
 			},
-			Spec:   ipamv1.IPAddressClaimSpec{ClusterName: clusterName, PoolRef: ipamv1.IPPoolReference{APIGroup: "ipam.cluster.x-k8s.io", Kind: "InClusterIPPool", Name: "pool"}},
-			Status: ipamv1.IPAddressClaimStatus{AddressRef: ipamv1.IPAddressReference{Name: claimName}},
+			Spec:   ipamv1.IPAddressClaimSpec{ClusterName: clusterName, PoolRef: lanPool},
+			Status: ipamv1.IPAddressClaimStatus{AddressRef: ipamv1.IPAddressReference{Name: name}},
 		}
-		address := &ipamv1.IPAddress{
-			ObjectMeta: metav1.ObjectMeta{Name: claimName},
+		ipAddress := &ipamv1.IPAddress{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: ipamv1.IPAddressSpec{
-				ClaimRef: ipamv1.IPAddressClaimReference{Name: claimName},
-				PoolRef:  ipamv1.IPPoolReference{APIGroup: "ipam.cluster.x-k8s.io", Kind: "InClusterIPPool", Name: "pool"},
-				Address:  "192.0.2.10",
+				ClaimRef: ipamv1.IPAddressClaimReference{Name: name},
+				PoolRef:  lanPool,
+				Address:  address,
 				Prefix:   ptr.To[int32](24),
 				Gateway:  "192.0.2.1",
 			},
 		}
-		return []client.Object{claim, address}
+		return []client.Object{claim, ipAddress}
+	}
+
+	// peerMachine returns a second Machine and KubevirtMachine, a copy of the first ones, that use
+	// the same bootstrap data secret.
+	peerMachine := func() (*clusterv1.Machine, *infrav1.KubevirtMachine) {
+		kvm := kubevirtMachine.DeepCopy()
+		kvm.Name = kubevirtMachineName + "-2"
+		kvm.UID = "test-kubevirt-machine-2-uid"
+		kvm.OwnerReferences[0].Name = machineName + "-2"
+		m := testing.NewMachine(clusterName, machineName+"-2", kvm)
+		m.Spec.Bootstrap = clusterv1.Bootstrap{DataSecretName: &bootstrapSecretName}
+		return m, kvm
+	}
+
+	getVM := func(cl client.Client, kvm *infrav1.KubevirtMachine) *kubevirtv1.VirtualMachine {
+		vm := &kubevirtv1.VirtualMachine{}
+		ExpectWithOffset(1, cl.Get(gocontext.Background(), client.ObjectKey{Namespace: kvm.Namespace, Name: kvm.Name}, vm)).To(Succeed())
+		return vm
+	}
+
+	getSecret := func(cl client.Client, name string) *corev1.Secret {
+		secret := &corev1.Secret{}
+		ExpectWithOffset(1, cl.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: name}, secret)).To(Succeed())
+		return secret
 	}
 
 	It("claims an address and does not create the VM until it is allocated", func() {
@@ -172,7 +216,7 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 	})
 
 	It("creates the VM with a static network configuration once the address is allocated", func() {
-		setup(boundClaimAndAddress()...)
+		setup(boundClaimAndAddress(kubevirtMachine, "192.0.2.10")...)
 
 		out, err := reconciler.reconcileNormal(machineContext)
 		Expect(err).NotTo(HaveOccurred())
@@ -180,66 +224,121 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(out).To(Equal(ctrl.Result{RequeueAfter: 20 * time.Second}))
 		Expect(conditions.IsTrue(kubevirtMachine, infrav1.IPAddressClaimedCondition)).To(BeTrue())
 
-		vm := &kubevirtv1.VirtualMachine{}
-		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}, vm)).To(Succeed())
+		vm := getVM(c, kubevirtMachine)
 		Expect(vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress).To(Equal("02:00:c0:00:02:0a"))
-		var drive *kubevirtv1.CloudInitConfigDriveSource
-		for _, v := range vm.Spec.Template.Spec.Volumes {
-			if v.Name == "cloudinitvolume" {
-				drive = v.CloudInitConfigDrive
-			}
-		}
+		drive := cloudInitConfigDrive(vm)
 		Expect(drive).NotTo(BeNil())
-		Expect(drive.NetworkDataSecretRef).To(Equal(&corev1.LocalObjectReference{Name: bootstrapSecretName + "-userdata"}))
+		Expect(drive.UserDataSecretRef).To(Equal(&corev1.LocalObjectReference{Name: bootstrapSecretName + "-userdata"}))
+		Expect(drive.NetworkDataSecretRef).To(Equal(&corev1.LocalObjectReference{Name: kubevirtMachine.Name + "-networkdata"}))
 
-		secret := &corev1.Secret{}
-		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: bootstrapSecretName + "-userdata"}, secret)).To(Succeed())
-		Expect(secret.Data).To(HaveKey("userdata"))
-		Expect(secret.Data).To(HaveKey("networkdata"))
+		userData := getSecret(c, bootstrapSecretName+"-userdata")
+		Expect(userData.Data).To(HaveLen(1))
+		Expect(userData.Data).To(HaveKey("userdata"))
+
+		networkDataSecret := getSecret(c, kubevirtMachine.Name+"-networkdata")
+		Expect(networkDataSecret.Labels).To(HaveKeyWithValue(clusterv1.ClusterNameLabel, clusterName))
+		Expect(networkDataSecret.Data).To(HaveLen(1))
 		networkData := map[string]interface{}{}
-		Expect(json.Unmarshal(secret.Data["networkdata"], &networkData)).To(Succeed())
-		Expect(string(secret.Data["networkdata"])).To(ContainSubstring(`"ip_address":"192.0.2.10"`))
-		Expect(string(secret.Data["networkdata"])).To(ContainSubstring(`"gateway":"192.0.2.1"`))
-
-		// The rendered configuration is kept in a per-machine Secret owned by the KubevirtMachine,
-		// which a change to it maps back to.
-		perMachine := &corev1.Secret{}
-		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}, perMachine)).To(Succeed())
-		Expect(perMachine.Data["networkdata"]).To(Equal(secret.Data["networkdata"]))
-		Expect(metav1.IsControlledBy(perMachine, kubevirtMachine)).To(BeTrue())
-		Expect(reconciler.SecretToKubevirtMachines(gocontext.Background(), perMachine)).To(ConsistOf(
-			ctrl.Request{NamespacedName: client.ObjectKeyFromObject(kubevirtMachine)}))
+		Expect(json.Unmarshal(networkDataSecret.Data["networkdata"], &networkData)).To(Succeed())
+		Expect(string(networkDataSecret.Data["networkdata"])).To(ContainSubstring(`"ip_address":"192.0.2.10"`))
+		Expect(string(networkDataSecret.Data["networkdata"])).To(ContainSubstring(`"gateway":"192.0.2.1"`))
 	})
 
 	It("renders cloud-init network config v2 for the noCloud data source", func() {
 		kubevirtMachine.Spec.CloudInit = &infrav1.CloudInitSpec{DataSource: infrav1.CloudInitDataSourceNoCloud}
-		setup(boundClaimAndAddress()...)
+		setup(boundClaimAndAddress(kubevirtMachine, "192.0.2.10")...)
 
 		_, err := reconciler.reconcileNormal(machineContext)
 		Expect(err).NotTo(HaveOccurred())
 
-		vm := &kubevirtv1.VirtualMachine{}
-		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}, vm)).To(Succeed())
-		var noCloud *kubevirtv1.CloudInitNoCloudSource
-		for _, v := range vm.Spec.Template.Spec.Volumes {
-			if v.Name == "cloudinitvolume" {
-				noCloud = v.CloudInitNoCloud
-			}
-		}
+		noCloud := cloudInitNoCloud(getVM(c, kubevirtMachine))
 		Expect(noCloud).NotTo(BeNil())
-		Expect(noCloud.NetworkDataSecretRef).To(Equal(&corev1.LocalObjectReference{Name: bootstrapSecretName + "-userdata"}))
+		Expect(noCloud.NetworkDataSecretRef).To(Equal(&corev1.LocalObjectReference{Name: kubevirtMachine.Name + "-networkdata"}))
 
-		secret := &corev1.Secret{}
-		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: bootstrapSecretName + "-userdata"}, secret)).To(Succeed())
-		Expect(string(secret.Data["networkdata"])).To(ContainSubstring("version: 2"))
-		Expect(string(secret.Data["networkdata"])).To(ContainSubstring("192.0.2.10/24"))
+		networkDataSecret := getSecret(c, kubevirtMachine.Name+"-networkdata")
+		Expect(string(networkDataSecret.Data["networkdata"])).To(ContainSubstring("version: 2"))
+		Expect(string(networkDataSecret.Data["networkdata"])).To(ContainSubstring("192.0.2.10/24"))
 	})
 
-	It("keeps the address until the VM is gone, then releases it", func() {
+	It("writes the network data and the VM to the infra cluster only", func() {
+		external := fake.NewClientBuilder().WithScheme(testing.SetupScheme()).Build()
+		setupWithInfraClient(external, boundClaimAndAddress(kubevirtMachine, "192.0.2.10")...)
+
+		_, err := reconciler.reconcileNormal(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+
+		vm := getVM(external, kubevirtMachine)
+		Expect(cloudInitConfigDrive(vm).NetworkDataSecretRef).To(Equal(&corev1.LocalObjectReference{Name: kubevirtMachine.Name + "-networkdata"}))
+		Expect(string(getSecret(external, kubevirtMachine.Name+"-networkdata").Data["networkdata"])).To(ContainSubstring(`"ip_address":"192.0.2.10"`))
+
+		// Nothing is written to the management cluster but the claims.
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}, &corev1.Secret{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	Context("when machines share a bootstrap data secret", func() {
+		It("gives each machine the network data rendered from its own addresses", func() {
+			machine2, kubevirtMachine2 := peerMachine()
+			objects := append(boundClaimAndAddress(kubevirtMachine, "192.0.2.10"), boundClaimAndAddress(kubevirtMachine2, "192.0.2.11")...)
+			setup(append(objects, machine2, kubevirtMachine2)...)
+			machineContext2 := newMachineContext(machine2, kubevirtMachine2)
+
+			_, err := reconciler.reconcileNormal(machineContext)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.reconcileNormal(machineContext2)
+			Expect(err).NotTo(HaveOccurred())
+			// Reconciling the first machine again must not pick up the second one's data either.
+			_, err = reconciler.reconcileNormal(machineContext)
+			Expect(err).NotTo(HaveOccurred())
+
+			for kvm, expected := range map[*infrav1.KubevirtMachine]struct{ ip, mac string }{
+				kubevirtMachine:  {ip: "192.0.2.10", mac: "02:00:c0:00:02:0a"},
+				kubevirtMachine2: {ip: "192.0.2.11", mac: "02:00:c0:00:02:0b"},
+			} {
+				vm := getVM(c, kvm)
+				Expect(vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress).To(Equal(expected.mac))
+				drive := cloudInitConfigDrive(vm)
+				Expect(drive.UserDataSecretRef.Name).To(Equal(bootstrapSecretName + "-userdata"))
+				Expect(drive.NetworkDataSecretRef.Name).To(Equal(kvm.Name + "-networkdata"))
+
+				networkData := string(getSecret(c, drive.NetworkDataSecretRef.Name).Data["networkdata"])
+				Expect(networkData).To(ContainSubstring(`"ip_address":"` + expected.ip + `"`))
+				Expect(networkData).To(ContainSubstring(`"ethernet_mac_address":"` + expected.mac + `"`))
+			}
+			Expect(getSecret(c, bootstrapSecretName+"-userdata").Data).NotTo(HaveKey("networkdata"))
+		})
+
+		It("gives each machine its own spec.cloudInit network data", func() {
+			machine2, kubevirtMachine2 := peerMachine()
+			kubevirtMachine.Spec.Network = nil
+			kubevirtMachine.Spec.CloudInit = &infrav1.CloudInitSpec{NetworkData: ptr.To(`{"networks":[{"ip_address":"192.0.2.10"}]}`)}
+			kubevirtMachine2.Spec.Network = nil
+			kubevirtMachine2.Spec.CloudInit = &infrav1.CloudInitSpec{NetworkData: ptr.To(`{"networks":[{"ip_address":"192.0.2.11"}]}`)}
+			setup(machine2, kubevirtMachine2)
+			machineContext2 := newMachineContext(machine2, kubevirtMachine2)
+
+			_, err := reconciler.reconcileNormal(machineContext)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = reconciler.reconcileNormal(machineContext2)
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, kvm := range []*infrav1.KubevirtMachine{kubevirtMachine, kubevirtMachine2} {
+				drive := cloudInitConfigDrive(getVM(c, kvm))
+				Expect(drive.NetworkDataSecretRef.Name).To(Equal(kvm.Name + "-networkdata"))
+				Expect(getSecret(c, drive.NetworkDataSecretRef.Name).Data["networkdata"]).To(Equal([]byte(*kvm.Spec.CloudInit.NetworkData)))
+			}
+		})
+	})
+
+	It("keeps the address until the VM is gone, then releases it and deletes the network data secret", func() {
 		vmObj := &kubevirtv1.VirtualMachine{
 			ObjectMeta: metav1.ObjectMeta{Name: kubevirtMachine.Name, Namespace: kubevirtMachine.Namespace},
 		}
-		setup(append(boundClaimAndAddress(), vmObj)...)
+		networkDataSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: kubevirtMachine.Name + "-networkdata", Namespace: kubevirtMachine.Namespace},
+			Data:       map[string][]byte{"networkdata": []byte("{}")},
+		}
+		setup(append(boundClaimAndAddress(kubevirtMachine, "192.0.2.10"), vmObj, networkDataSecret)...)
 
 		// First pass deletes the VM but keeps the claim.
 		out, err := reconciler.reconcileDelete(machineContext)
@@ -249,6 +348,8 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: claimName}, claim)).To(Succeed())
 		Expect(claim.Finalizers).To(ContainElement(ipam.ClaimProtectionFinalizer))
 		Expect(kubevirtMachine.Finalizers).To(ContainElement(infrav1.MachineFinalizer))
+		err = c.Get(gocontext.Background(), types.NamespacedName{Namespace: kubevirtMachine.Namespace, Name: networkDataSecret.Name}, &corev1.Secret{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 
 		// Second pass finds the VM gone and releases the claim.
 		out, err = reconciler.reconcileDelete(machineContext)
@@ -266,10 +367,11 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		_, err := reconciler.reconcileNormal(machineContext)
 		Expect(err).NotTo(HaveOccurred())
 
-		secret := &corev1.Secret{}
-		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: bootstrapSecretName + "-userdata"}, secret)).To(Succeed())
+		secret := getSecret(c, bootstrapSecretName+"-userdata")
 		Expect(secret.Data).To(HaveLen(1))
 		Expect(secret.Data).To(HaveKey("userdata"))
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}, &corev1.Secret{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		Expect(conditions.Get(kubevirtMachine, infrav1.IPAddressClaimedCondition)).To(BeNil())
 
 		claims := &ipamv1.IPAddressClaimList{}

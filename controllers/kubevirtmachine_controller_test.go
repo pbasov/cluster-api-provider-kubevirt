@@ -443,8 +443,11 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		Expect(bootstrapDataSecret.Labels).To(HaveLen(1))
 		Expect(bootstrapDataSecret.Labels).To(HaveKeyWithValue("hello", "world"))
 
-		// Without a networkDataSecretRef, the config drive must not reference network data
+		// Without network data, no network data secret is written and the config drive does not
+		// reference one
 		Expect(bootstrapDataSecret.Data).ShouldNot(HaveKey("networkdata"))
+		networkDataSecretKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}
+		Expect(apierrors.IsNotFound(fakeClient.Get(gocontext.Background(), networkDataSecretKey, &corev1.Secret{}))).To(BeTrue())
 		Expect(cloudInitConfigDrive(vm)).ShouldNot(BeNil())
 		Expect(cloudInitConfigDrive(vm).NetworkDataSecretRef).To(BeNil())
 	})
@@ -482,14 +485,18 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		_, err := kubevirtMachineReconciler.reconcileNormal(machineContext)
 		Expect(err).ShouldNot(HaveOccurred())
 
-		// The network data must be stored alongside the user data, in the same secret
+		// The network data must be stored in a secret of the machine's own, not alongside the user
+		// data, which machines can share
 		bootstrapDataSecretKey := client.ObjectKey{Namespace: machineContext.Machine.GetNamespace(), Name: *machineContext.Machine.Spec.Bootstrap.DataSecretName + "-userdata"}
 		bootstrapDataSecret := &corev1.Secret{}
 		Expect(fakeClient.Get(gocontext.Background(), bootstrapDataSecretKey, bootstrapDataSecret)).To(Succeed())
-		Expect(bootstrapDataSecret.Data).To(HaveKeyWithValue("userdata", []byte("shell-script")))
-		Expect(bootstrapDataSecret.Data).To(HaveKeyWithValue("networkdata", networkData))
+		Expect(bootstrapDataSecret.Data).To(Equal(map[string][]byte{"userdata": []byte("shell-script")}))
+		networkDataSecretKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}
+		machineNetworkDataSecret := &corev1.Secret{}
+		Expect(fakeClient.Get(gocontext.Background(), networkDataSecretKey, machineNetworkDataSecret)).To(Succeed())
+		Expect(machineNetworkDataSecret.Data).To(Equal(map[string][]byte{"networkdata": networkData}))
 
-		// The config drive must reference that secret for both user data and network data
+		// The config drive must reference the user data and the network data secrets
 		vm := &kubevirtv1.VirtualMachine{}
 		vmKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}
 		Expect(fakeClient.Get(gocontext.Background(), vmKey, vm)).To(Succeed())
@@ -499,7 +506,7 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		Expect(configDrive.UserDataSecretRef).ShouldNot(BeNil())
 		Expect(configDrive.UserDataSecretRef.Name).To(Equal(bootstrapDataSecretKey.Name))
 		Expect(configDrive.NetworkDataSecretRef).ShouldNot(BeNil())
-		Expect(configDrive.NetworkDataSecretRef.Name).To(Equal(bootstrapDataSecretKey.Name))
+		Expect(configDrive.NetworkDataSecretRef.Name).To(Equal(networkDataSecretKey.Name))
 	})
 
 	It("should attach a NoCloud data source with network data when the noCloud data source is selected", func() {
@@ -540,8 +547,11 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		bootstrapDataSecretKey := client.ObjectKey{Namespace: machineContext.Machine.GetNamespace(), Name: *machineContext.Machine.Spec.Bootstrap.DataSecretName + "-userdata"}
 		bootstrapDataSecret := &corev1.Secret{}
 		Expect(fakeClient.Get(gocontext.Background(), bootstrapDataSecretKey, bootstrapDataSecret)).To(Succeed())
-		Expect(bootstrapDataSecret.Data).To(HaveKeyWithValue("userdata", []byte("shell-script")))
-		Expect(bootstrapDataSecret.Data).To(HaveKeyWithValue("networkdata", networkData))
+		Expect(bootstrapDataSecret.Data).To(Equal(map[string][]byte{"userdata": []byte("shell-script")}))
+		networkDataSecretKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}
+		machineNetworkDataSecret := &corev1.Secret{}
+		Expect(fakeClient.Get(gocontext.Background(), networkDataSecretKey, machineNetworkDataSecret)).To(Succeed())
+		Expect(machineNetworkDataSecret.Data).To(HaveKeyWithValue("networkdata", networkData))
 
 		vm := &kubevirtv1.VirtualMachine{}
 		vmKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}
@@ -555,7 +565,7 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		Expect(noCloud.UserDataSecretRef).ShouldNot(BeNil())
 		Expect(noCloud.UserDataSecretRef.Name).To(Equal(bootstrapDataSecretKey.Name))
 		Expect(noCloud.NetworkDataSecretRef).ShouldNot(BeNil())
-		Expect(noCloud.NetworkDataSecretRef.Name).To(Equal(bootstrapDataSecretKey.Name))
+		Expect(noCloud.NetworkDataSecretRef.Name).To(Equal(networkDataSecretKey.Name))
 	})
 
 	It("should attach inline cloud-init network data to the KubeVirt VM", func() {
@@ -570,9 +580,10 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		Expect(err).ShouldNot(HaveOccurred())
 
 		bootstrapDataSecretKey := client.ObjectKey{Namespace: machineContext.Machine.GetNamespace(), Name: *machineContext.Machine.Spec.Bootstrap.DataSecretName + "-userdata"}
-		bootstrapDataSecret := &corev1.Secret{}
-		Expect(fakeClient.Get(gocontext.Background(), bootstrapDataSecretKey, bootstrapDataSecret)).To(Succeed())
-		Expect(bootstrapDataSecret.Data).To(HaveKeyWithValue("networkdata", []byte(networkData)))
+		networkDataSecretKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}
+		machineNetworkDataSecret := &corev1.Secret{}
+		Expect(fakeClient.Get(gocontext.Background(), networkDataSecretKey, machineNetworkDataSecret)).To(Succeed())
+		Expect(machineNetworkDataSecret.Data).To(HaveKeyWithValue("networkdata", []byte(networkData)))
 
 		vm := &kubevirtv1.VirtualMachine{}
 		vmKey := client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}
@@ -580,7 +591,7 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		configDrive := cloudInitConfigDrive(vm)
 		Expect(configDrive).ShouldNot(BeNil())
 		Expect(configDrive.UserDataSecretRef.Name).To(Equal(bootstrapDataSecretKey.Name))
-		Expect(configDrive.NetworkDataSecretRef.Name).To(Equal(bootstrapDataSecretKey.Name))
+		Expect(configDrive.NetworkDataSecretRef.Name).To(Equal(networkDataSecretKey.Name))
 	})
 
 	It("should fail when the referenced network data secret has no networkdata key", func() {

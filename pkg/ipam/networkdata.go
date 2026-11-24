@@ -26,12 +26,6 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
 )
 
-// NetworkDataSecretName returns the name of the per-machine Secret, in the namespace of the
-// KubevirtMachine, that holds the network configuration rendered from spec.network.
-func NetworkDataSecretName(machineName string) string {
-	return machineName + "-networkdata"
-}
-
 // RenderNetworkData renders the interfaces in the network configuration format expected by the
 // cloud-init data source: OpenStack network_data.json for configDrive, cloud-init network
 // configuration version 2 for noCloud.

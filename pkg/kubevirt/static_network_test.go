@@ -87,7 +87,7 @@ var _ = Describe("Static network from spec.network", func() {
 		Expect(drive).NotTo(BeNil())
 		Expect(drive.UserDataSecretRef.Name).To(Equal("fakeDataSecretName-userdata"))
 		Expect(drive.NetworkDataSecretRef).NotTo(BeNil())
-		Expect(drive.NetworkDataSecretRef.Name).To(Equal("fakeDataSecretName-userdata"))
+		Expect(drive.NetworkDataSecretRef.Name).To(Equal(kubevirtMachineName + "-networkdata"))
 
 		interfaces := vm.Spec.Template.Spec.Domain.Devices.Interfaces
 		Expect(interfaces[0].MacAddress).To(Equal("02:00:c0:00:02:0a"))

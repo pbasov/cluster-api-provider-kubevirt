@@ -175,7 +175,8 @@ func RenderNoCloudNetworkConfig(interfaces []InterfaceConfig) ([]byte, error) {
 		for _, addr := range iface.Addresses {
 			eth.Addresses = append(eth.Addresses, addr.CIDR())
 			if addr.Gateway != nil && !defaultRouteSet {
-				eth.Routes = []noCloudRoute{{To: "default", Via: addr.Gateway.String()}}
+				// "0.0.0.0/0" rather than "default", which older cloud-init renderers do not know.
+				eth.Routes = []noCloudRoute{{To: "0.0.0.0/0", Via: addr.Gateway.String()}}
 				defaultRouteSet = true
 			}
 		}

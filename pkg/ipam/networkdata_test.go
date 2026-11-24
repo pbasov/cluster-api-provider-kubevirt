@@ -59,7 +59,7 @@ ethernets:
     match: {macaddress: "02:00:c0:00:02:0a"}
     dhcp4: false
     addresses: [192.0.2.10/24]
-    routes: [{to: default, via: 192.0.2.1}]
+    routes: [{to: 0.0.0.0/0, via: 192.0.2.1}]
     nameservers: {addresses: [192.0.2.53]}
     mtu: 1500
   storage:

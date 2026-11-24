@@ -64,6 +64,24 @@ const (
 	BootstrapFailedReason = "BootstrapFailed"
 )
 
+const (
+	// IPAddressClaimedCondition documents the status of the IP addresses a KubevirtMachine claims
+	// from IPAM pools through spec.network. It is only set when spec.network is set.
+	IPAddressClaimedCondition = "IPAddressClaimed"
+
+	// WaitingForIPAddressReason (Severity=Info) documents a KubevirtMachine waiting for the IPAM
+	// provider to allocate the addresses it claimed.
+	WaitingForIPAddressReason = "WaitingForIPAddress"
+
+	// IPAddressClaimFailedReason (Severity=Error) documents a KubevirtMachine that could not create
+	// its IPAddressClaims or read the allocated IPAddresses.
+	IPAddressClaimFailedReason = "IPAddressClaimFailed"
+
+	// IPAddressInvalidReason (Severity=Error) documents a KubevirtMachine whose allocated IPAddress
+	// cannot be used, e.g. an IPv6 address or a malformed prefix.
+	IPAddressInvalidReason = "IPAddressInvalid"
+)
+
 // Conditions and condition Reasons for the KubevirtCluster object
 
 const (

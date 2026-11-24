@@ -40,6 +40,7 @@ type VirtualMachineTemplateSpec struct {
 }
 
 // KubevirtMachineSpec defines the desired state of KubevirtMachine.
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || !has(self.cloudInit) || (!has(self.cloudInit.networkData) && !has(self.cloudInit.networkDataSecretRef))",message="network cannot be combined with cloudInit.networkData or cloudInit.networkDataSecretRef"
 type KubevirtMachineSpec struct {
 	VirtualMachineTemplate VirtualMachineTemplateSpec `json:"virtualMachineTemplate,omitempty"`
 
@@ -62,6 +63,21 @@ type KubevirtMachineSpec struct {
 	// are immutable on KubevirtMachine after creation.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+
+	// Network configures static addressing of the virtual machine's interfaces from
+	// Cluster API IPAM pools. For every interface listed here the controller creates one
+	// IPAddressClaim per pool, waits for the resulting IPAddress, pins a MAC address
+	// derived from that address on the interface (unless the template sets one) and
+	// renders a static network configuration for the guest, in the format of the cloud-init
+	// data source selected by spec.cloudInit.dataSource (config drive by default), so the
+	// guest needs no DHCP. The configuration is stored in a per-machine Secret and delivered
+	// the same way as spec.cloudInit.networkDataSecretRef. The claimed addresses are also
+	// reported in status.addresses, without relying on the guest agent.
+	// It cannot be combined with spec.cloudInit.networkData or networkDataSecretRef.
+	// When unset, interfaces are configured the way the guest and the virtual machine
+	// template decide.
+	// +optional
+	Network *NetworkSpec `json:"network,omitempty"`
 }
 
 // CloudInitDataSource describes the type of cloud-init data source attached to the virtual machine.
@@ -140,6 +156,39 @@ func (c *CloudInitSpec) GetNetworkData() *string {
 	}
 
 	return c.NetworkData
+}
+
+// NetworkSpec defines static guest networking for a KubevirtMachine.
+type NetworkSpec struct {
+	// Interfaces lists the interfaces of the virtual machine template that get their
+	// addresses from IPAM pools.
+	// +kubebuilder:validation:MinItems=1
+	// +listType=map
+	// +listMapKey=name
+	Interfaces []NetworkInterfaceSpec `json:"interfaces"`
+}
+
+// NetworkInterfaceSpec defines the addressing of one interface of the virtual machine.
+type NetworkInterfaceSpec struct {
+	// Name is the name of the interface in
+	// spec.virtualMachineTemplate.spec.template.spec.domain.devices.interfaces.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// AddressesFromPools references the IPAM pools to claim addresses from, one address
+	// per pool. The first claimed address that has a gateway provides the default route.
+	// Only IPv4 pools are supported.
+	// +kubebuilder:validation:MinItems=1
+	AddressesFromPools []corev1.TypedLocalObjectReference `json:"addressesFromPools"`
+
+	// Nameservers is a list of DNS servers configured in the guest.
+	// +optional
+	Nameservers []string `json:"nameservers,omitempty"`
+
+	// MTU is the MTU configured on the interface in the guest.
+	// +optional
+	// +kubebuilder:validation:Minimum=68
+	MTU *int32 `json:"mtu,omitempty"`
 }
 
 // VirtualMachineBootstrapCheckSpec defines how the controller will remotely check CAPI Sentinel file content.

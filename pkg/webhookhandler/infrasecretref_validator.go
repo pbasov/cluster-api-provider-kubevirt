@@ -77,6 +77,11 @@ func (v *infraSecretRefValidator) HandleMachine(_ context.Context, req admission
 		if err := validateInfraClusterSecretRef(machine.Spec.InfraClusterSecretRef, machine.Namespace, v.controllerNamespace); err != nil {
 			return admission.Denied(err.Error())
 		}
+		if req.Operation == admissionv1.Create {
+			if err := validateNetworkInterfaces(&machine.Spec); err != nil {
+				return admission.Denied(err.Error())
+			}
+		}
 	case admissionv1.Delete:
 		// no validation needed on delete
 	default:

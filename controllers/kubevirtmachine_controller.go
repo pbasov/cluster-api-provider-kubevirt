@@ -548,7 +548,7 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
 		Type:    infrav1.IPAddressClaimedCondition,
 		Status:  metav1.ConditionTrue,
-		Reason:  "IPAddressClaimed",
+		Reason:  infrav1.IPAddressClaimedReason,
 		Message: "All IP addresses of spec.network are allocated",
 	})
 	ctx.StaticNetwork = result.Interfaces

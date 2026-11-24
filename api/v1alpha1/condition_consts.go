@@ -66,8 +66,13 @@ const (
 
 const (
 	// IPAddressClaimedCondition documents the status of the IP addresses a KubevirtMachine claims
-	// from IPAM pools through spec.network. It is only set when spec.network is set.
+	// from IPAM pools through spec.network. It is only set when spec.network is set, and is then
+	// part of the summary in the Ready condition.
 	IPAddressClaimedCondition = "IPAddressClaimed"
+
+	// IPAddressClaimedReason documents a KubevirtMachine whose addresses of spec.network are all
+	// allocated.
+	IPAddressClaimedReason = "IPAddressClaimed"
 
 	// WaitingForIPAddressReason (Severity=Info) documents a KubevirtMachine waiting for the IPAM
 	// provider to allocate the addresses it claimed.

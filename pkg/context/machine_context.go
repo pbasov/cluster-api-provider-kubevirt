@@ -69,11 +69,15 @@ func (c *MachineContext) PatchKubevirtMachine(patchHelper *patch.Helper) error {
 	// Always update the readyCondition by summarizing the state of other conditions.
 	// BootstrapExecSucceeded is always set: True when bootstrap check passes or is
 	// not supported, False while waiting. This prevents premature Ready=True.
+	// IPAddressClaimed is only set for machines with spec.network, and only counts for them:
+	// a machine is not ready while its addresses are not allocated.
 	if err := conditions.SetSummaryCondition(c.KubevirtMachine, c.KubevirtMachine, clusterv1.ReadyCondition,
 		conditions.ForConditionTypes{
+			infrav1.IPAddressClaimedCondition,
 			infrav1.VMProvisionedCondition,
 			infrav1.BootstrapExecSucceededCondition,
 		},
+		conditions.IgnoreTypesIfMissing{infrav1.IPAddressClaimedCondition},
 	); err != nil {
 		return err
 	}

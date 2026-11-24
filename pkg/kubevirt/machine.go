@@ -228,36 +228,45 @@ func (m *Machine) hasReadyCondition() bool {
 	return false
 }
 
-// Address returns the IP address of the VM. When spec.network is set, this is the first address
-// claimed from IPAM; otherwise it is the address the VMI reports on its first interface.
+// Address returns the IP address the controller uses to reach the VM, in particular for the SSH
+// bootstrap check. It is the address the VMI reports on its first interface, as without
+// spec.network: that keeps the check on the network the management cluster reached before, such
+// as the pod network, rather than moving it to a secondary network it may not route to. Only when
+// the VMI reports no address there, as for a bridged interface without the guest agent, is it the
+// first address claimed for spec.network, then the only address known for the VM.
 func (m *Machine) Address() string {
-	if addresses := m.staticAddresses(); len(addresses) > 0 {
-		return addresses[0]
+	if m.vmiInstance != nil && len(m.vmiInstance.Status.Interfaces) > 0 && m.vmiInstance.Status.Interfaces[0].IP != "" {
+		return m.vmiInstance.Status.Interfaces[0].IP
 	}
 
-	if m.vmiInstance != nil && len(m.vmiInstance.Status.Interfaces) > 0 {
-		return m.vmiInstance.Status.Interfaces[0].IP
+	if addresses := m.staticAddresses(); len(addresses) > 0 {
+		return addresses[0]
 	}
 
 	return ""
 }
 
-// Addresses returns all IP addresses of the VM (for dual-stack support).
-// When spec.network is set, these are the addresses claimed from IPAM, which are known without
-// the guest agent; otherwise it collects IPs from all network interfaces of the VMI, supporting
-// both IPv4 and IPv6.
+// Addresses returns all IP addresses of the VM, without duplicates: first the addresses claimed
+// for spec.network, in interface and pool order, which are known from the start and do not depend
+// on the guest agent, then the addresses the VMI reports on its interfaces, IPv4 and IPv6, in
+// interface order.
 func (m *Machine) Addresses() []string {
-	if addresses := m.staticAddresses(); len(addresses) > 0 {
+	addresses := m.staticAddresses()
+	if m.vmiInstance == nil {
 		return addresses
 	}
 
-	if m.vmiInstance == nil {
-		return nil
+	seen := make(map[string]bool, len(addresses))
+	for _, address := range addresses {
+		seen[address] = true
 	}
-
-	var addresses []string
 	for _, iface := range m.vmiInstance.Status.Interfaces {
-		addresses = append(addresses, iface.IPs...)
+		for _, address := range iface.IPs {
+			if !seen[address] {
+				seen[address] = true
+				addresses = append(addresses, address)
+			}
+		}
 	}
 	return addresses
 }

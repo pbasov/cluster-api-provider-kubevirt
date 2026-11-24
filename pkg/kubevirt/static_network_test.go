@@ -106,18 +106,34 @@ var _ = Describe("Static network from spec.network", func() {
 		Expect(vm.Spec.Template.Spec.Domain.Devices.Interfaces[0].MacAddress).To(Equal("02:11:22:33:44:55"))
 	})
 
-	It("reports the claimed addresses instead of the VMI addresses", func() {
-		machineContext = newContext(kubevirtv1.Interface{Name: "lan"})
+	newMachineWithVMI := func(interfaces ...kubevirtv1.VirtualMachineInstanceNetworkInterface) *Machine {
+		machineContext = newContext(kubevirtv1.Interface{Name: "default"}, kubevirtv1.Interface{Name: "lan"})
 		machineContext.StaticNetwork = staticLan
 		vmi := testing.NewVirtualMachineInstance(machineContext.KubevirtMachine)
-		vmi.Status.Interfaces = []kubevirtv1.VirtualMachineInstanceNetworkInterface{
-			{IP: "198.51.100.99", IPs: []string{"198.51.100.99", "203.0.113.99"}},
-		}
+		vmi.Status.Interfaces = interfaces
 		vm := testing.NewVirtualMachine(vmi)
 		c := fake.NewClientBuilder().WithScheme(testing.SetupScheme()).WithObjects([]client.Object{vmi, vm}...).Build()
 
 		externalMachine, err := defaultTestMachine(machineContext, vmi.Namespace, c, FakeVMCommandExecutor{false}, []byte{})
-		Expect(err).NotTo(HaveOccurred())
+		ExpectWithOffset(1, err).NotTo(HaveOccurred())
+		return externalMachine
+	}
+
+	It("reports the claimed addresses first, then the VMI addresses, and checks bootstrap on the VMI's first interface", func() {
+		// A pod network interface, dual stack, and the static interface as the guest agent reports it.
+		externalMachine := newMachineWithVMI(
+			kubevirtv1.VirtualMachineInstanceNetworkInterface{Name: "default", IP: "198.51.100.99", IPs: []string{"198.51.100.99", "2001:db8::99"}},
+			kubevirtv1.VirtualMachineInstanceNetworkInterface{Name: "lan", IP: "192.0.2.10", IPs: []string{"192.0.2.10"}},
+		)
+
+		Expect(externalMachine.Address()).To(Equal("198.51.100.99"))
+		Expect(externalMachine.Addresses()).To(Equal([]string{"192.0.2.10", "198.51.100.99", "2001:db8::99"}))
+	})
+
+	It("falls back to the claimed address when the VMI reports none", func() {
+		// A bridged interface without the guest agent.
+		externalMachine := newMachineWithVMI(kubevirtv1.VirtualMachineInstanceNetworkInterface{Name: "lan"})
+
 		Expect(externalMachine.Address()).To(Equal("192.0.2.10"))
 		Expect(externalMachine.Addresses()).To(Equal([]string{"192.0.2.10"}))
 	})
@@ -130,5 +146,6 @@ var _ = Describe("Static network from spec.network", func() {
 		externalMachine, err := defaultTestMachine(machineContext, "default", c, FakeVMCommandExecutor{false}, []byte{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(externalMachine.Address()).To(Equal("192.0.2.10"))
+		Expect(externalMachine.Addresses()).To(Equal([]string{"192.0.2.10"}))
 	})
 })

@@ -6,6 +6,25 @@ VM is attached to a secondary network that has no DHCP server, or must not use o
 claim the addresses from a [Cluster API IPAM](https://cluster-api.sigs.k8s.io/developer/providers/contracts/ipam)
 pool and configure them statically in the guest.
 
+## Prerequisites
+
+- A Cluster API IPAM provider, for example the
+  [in-cluster IPAM provider](https://github.com/kubernetes-sigs/cluster-api-ipam-provider-in-cluster).
+  Cluster API core installs the `IPAddressClaim` and `IPAddress` CRDs.
+- The `KubevirtIPAM` feature gate of the CAPK manager (alpha, disabled by default), and RBAC on
+  `ipam.cluster.x-k8s.io` for the manager. Both come with the kustomize component
+  `config/components/ipam`: add it to the kustomization that builds the provider
+  (`components: [../components/ipam]` in `config/default`). For an installation done by
+  `clusterctl`, apply the `ClusterRole` and `ClusterRoleBinding` of that component (with the
+  `capk-` prefix and the `capk-system` namespace) and add `--feature-gates=KubevirtIPAM=true` to
+  the arguments of `capk-controller-manager`. A repeated `--feature-gates` flag adds to the gates
+  set by earlier ones.
+
+Without the gate the manager neither watches nor reads any `ipam.cluster.x-k8s.io` resource and
+starts without the IPAM API or RBAC. A `KubevirtMachine` with `spec.network` is then not
+provisioned: `IPAddressClaimed` and `VMProvisioned` are `False` with the reason
+`IPAMFeatureDisabled`, and a Warning event says how to enable the gate.
+
 ## How it works
 
 Set `spec.network` on the `KubevirtMachineTemplate` (or `KubevirtMachine`). For every interface
@@ -15,23 +34,29 @@ listed there, CAPK:
    `<machine>-<interface>-<index>`, controlled by the `KubevirtMachine` and protected by the
    `kubevirtmachine.infrastructure.cluster.x-k8s.io/ip-claim-protection` finalizer;
 2. waits until the IPAM provider binds every claim to an `IPAddress`. Progress is reported in the
-   `IPAddressClaimed` condition, including the `PoolExhausted` reason when the pool is full. The
-   VM is not created before that;
+   `IPAddressClaimed` condition, which is part of the `Ready` summary, including the
+   `PoolExhausted` reason when the pool is full. The VM is not created before that;
 3. pins a MAC address on the interface, unless the template already sets one. The MAC address is
    derived from the first address of the interface (`02:00` followed by the four octets), so it
    stays the same as long as the address does;
 4. renders the static configuration (addresses, one default route, DNS servers), matched by that
    MAC address, in the format of `spec.cloudInit.dataSource`: an OpenStack `network_data.json`
    document for `configDrive` (the default), cloud-init network config version 2 for `noCloud`.
-   It is stored in a per-machine secret `<machine>-networkdata`, owned by the `KubevirtMachine`,
-   and delivered exactly like a user-provided `spec.cloudInit.networkDataSecretRef`: copied into
-   the `<bootstrap secret>-userdata` secret under the key `networkdata` and referenced from the
-   cloud-init volume. cloud-init applies it before the network comes up, so the guest never runs
-   DHCP on the interface;
+   It is written to the secret `<kubevirtmachine>-networkdata` next to the VM in the infra
+   cluster, under the key `networkdata`, and referenced from the cloud-init volume. Each machine
+   has its own secret, also when machines share a bootstrap data secret; the
+   `<bootstrap secret>-userdata` secret holds only the user data. (`spec.cloudInit.networkData`
+   and `networkDataSecretRef` are delivered through the same per-machine secret.) cloud-init
+   applies it before the network comes up, so the guest never runs DHCP on the interface;
 5. reports the claimed addresses in `status.addresses`, without relying on the qemu guest agent.
+   They come first, followed by the addresses the VMI reports (IPv4 and IPv6), without
+   duplicates. The SSH bootstrap check keeps using the address the VMI reports on its first
+   interface, and uses the first claimed address only when the VMI reports none there (a bridged
+   interface without the guest agent).
 
-When the `KubevirtMachine` is deleted, the claims are released only after the VM is gone, so a
-replacement machine is never handed an address that is still in use.
+When the `KubevirtMachine` is deleted, the claims it controls are released only after the VM is
+gone, so a replacement machine is never handed an address that is still in use. The claims are
+found by ownership, not from `spec.network`. The network data secret is deleted with the machine.
 
 The address belongs to the `KubevirtMachine`: it survives VM restarts, stop/start, live migration
 and in-place updates, and is returned to the pool when the machine is deleted. A rollout that
@@ -111,10 +136,25 @@ spec:
 
 ## Notes and limitations
 
-- Only IPv4 pools are supported.
+- Only IPv4 is supported for now: one IPv4 address per interface, from one pool
+  (`addressesFromPools` accepts one entry), and up to three IPv4 nameservers. An IPv6 address
+  allocated by a pool stops the machine: `IPAddressClaimed` is `False` with the reason
+  `IPAddressInvalid` and a Warning event is emitted; the machine is not requeued. The API is
+  shaped for dual stack: `addressesFromPools` stays a list, so a second (IPv6) pool can be
+  allowed later by relaxing the limit, and the nameserver validation can be relaxed to IP
+  addresses.
+- The rendered network data is the guest's whole network configuration. Interfaces of the
+  template that are not listed in `spec.network` get no configuration in the guest (no DHCP).
+- Every interface of `spec.network` must exist in the VM template; the webhook rejects a
+  `KubevirtMachine` or `KubevirtMachineTemplate` that names another one on creation.
 - The guest image must use cloud-init with the datasource set in `spec.cloudInit.dataSource`.
 - The control plane endpoint is not derived from the pool. With a secondary network as the only
   interface, set `KubevirtCluster.spec.controlPlaneEndpoint` to an address served from inside the
   guests (for example a keepalived virtual IP).
-- `spec.network` is read when the VM is created; changing it on an existing machine has no effect
-  until the machine is replaced.
+- `spec.network` is immutable on a `KubevirtMachine`, like `spec.cloudInit`, and the
+  `KubevirtMachineTemplate` spec is immutable as a whole; change it by rolling out a new template.
+- The derived MAC address (`02:00` + IPv4 octets) is locally administered. If KubeMacPool manages
+  the namespace, make sure its range does not overlap, or set the MAC in the template.
+- `clusterctl move` moves the claims with their machines (owner references). Pools are not owned
+  by a cluster; label them with `clusterctl.cluster.x-k8s.io/move` to move them along.
+- `<kubevirtmachine>-networkdata` is a reserved secret name in the VM namespace.

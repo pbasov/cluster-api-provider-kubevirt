@@ -76,6 +76,9 @@ type KubevirtMachineSpec struct {
 	// virtual machine in the infra cluster. The claimed addresses are also reported in
 	// status.addresses, without relying on the guest agent. The claims are released when the
 	// KubevirtMachine is deleted, once its virtual machine is gone.
+	// Only IPv4 is supported for now: one IPv4 address per interface. An IPv6 address
+	// allocated by a pool is reported on the IPAddressClaimed condition with the
+	// IPAddressInvalid reason, and the machine is not provisioned.
 	// It cannot be combined with spec.cloudInit.networkData or networkDataSecretRef.
 	// Network data is applied during the VM's first boot, so this field's presence and value
 	// are immutable on KubevirtMachine after creation.
@@ -164,10 +167,17 @@ func (c *CloudInitSpec) GetNetworkData() *string {
 }
 
 // NetworkSpec defines static guest networking for a KubevirtMachine.
+//
+// Only IPv4 is supported for now: one IPv4 address per interface, from one pool, with IPv4
+// nameservers. An IPv6 address allocated by a pool is reported with the IPAddressInvalid reason
+// and the machine is not provisioned. The API is shaped for dual stack without a breaking
+// change: addressesFromPools is a list, limited to one entry for now, and the validation of
+// nameservers can be relaxed from IPv4 to IP addresses.
 type NetworkSpec struct {
 	// Interfaces lists the interfaces of the virtual machine template that get their
 	// addresses from IPAM pools.
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
 	// +listType=map
 	// +listMapKey=name
 	Interfaces []NetworkInterfaceSpec `json:"interfaces"`
@@ -182,17 +192,22 @@ type NetworkInterfaceSpec struct {
 
 	// AddressesFromPools references the IPAM pools to claim addresses from, one address
 	// per pool. The first claimed address that has a gateway provides the default route.
-	// Only IPv4 pools are supported.
+	// Only one IPv4 pool is supported for now. The field is a list so that a second pool,
+	// for an IPv6 address, can be allowed later without an API change.
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=1
 	AddressesFromPools []IPPoolReference `json:"addressesFromPools"`
 
-	// Nameservers is a list of DNS servers configured in the guest.
+	// Nameservers is a list of IPv4 addresses of DNS servers configured in the guest.
 	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:Format=ipv4
 	Nameservers []string `json:"nameservers,omitempty"`
 
 	// MTU is the MTU configured on the interface in the guest.
 	// +optional
 	// +kubebuilder:validation:Minimum=68
+	// +kubebuilder:validation:Maximum=65535
 	MTU *int32 `json:"mtu,omitempty"`
 }
 

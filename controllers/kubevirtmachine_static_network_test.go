@@ -390,6 +390,26 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(kubevirtMachine.Finalizers).NotTo(ContainElement(infrav1.MachineFinalizer))
 	})
 
+	It("stops with IPAddressInvalid when a pool allocates an IPv6 address", func() {
+		setup(boundClaimAndAddress(kubevirtMachine, "2001:db8::10")...)
+
+		out, err := reconciler.reconcileNormal(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{}), "terminal, not requeued")
+
+		cond := conditions.Get(kubevirtMachine, infrav1.IPAddressClaimedCondition)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal(infrav1.IPAddressInvalidReason))
+		Expect(cond.Message).To(ContainSubstring("only IPv4 pools are supported for now"))
+		Expect(recorder.Events).To(Receive(And(ContainSubstring("Warning"), ContainSubstring(infrav1.IPAddressInvalidReason))))
+
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}, &kubevirtv1.VirtualMachine{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name + "-networkdata"}, &corev1.Secret{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
 	It("releases the claims it owns even when spec.network no longer lists them", func() {
 		// A KubevirtMachine whose spec.network was removed before the field became immutable.
 		claims := boundClaimAndAddress(kubevirtMachine, "192.0.2.10")

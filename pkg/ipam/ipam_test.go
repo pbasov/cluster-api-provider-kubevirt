@@ -287,6 +287,13 @@ func TestReconcileClaimsInvalid(t *testing.T) {
 			},
 		},
 		{
+			name:    "IPv4-mapped IPv6 address",
+			network: lanNetwork(1),
+			objects: func(kvm *infrav1.KubevirtMachine) []client.Object {
+				return []client.Object{boundClaim(kvm, "test-machine-lan-0"), ipAddress("test-machine-lan-0", "::ffff:192.0.2.10", 24, "")}
+			},
+		},
+		{
 			name:    "prefix out of range",
 			network: lanNetwork(1),
 			objects: func(kvm *infrav1.KubevirtMachine) []client.Object {

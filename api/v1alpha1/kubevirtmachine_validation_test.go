@@ -170,6 +170,34 @@ func TestKubevirtMachinePoolReferenceRequiresAllFields(t *testing.T) {
 	}
 }
 
+func TestKubevirtMachineNetworkIsIPv4Only(t *testing.T) {
+	v := newCRDValidator(t, "infrastructure.cluster.x-k8s.io_kubevirtmachines.yaml")
+
+	withNameservers := func(nameservers ...string) *infrav1.NetworkSpec {
+		network := lanNetwork("pool")
+		network.Interfaces[0].Nameservers = nameservers
+		return network
+	}
+	expectValid(t, v.validate(t, newKubevirtMachine(withNameservers("192.0.2.53", "198.51.100.53", "203.0.113.53"), nil), nil))
+
+	t.Run("second pool for an interface", func(t *testing.T) {
+		network := lanNetwork("pool")
+		network.Interfaces[0].AddressesFromPools = append(network.Interfaces[0].AddressesFromPools,
+			infrav1.IPPoolReference{APIGroup: "ipam.cluster.x-k8s.io", Kind: "InClusterIPPool", Name: "ipv6-pool"})
+		expectInvalid(t, v.validate(t, newKubevirtMachine(network, nil), nil), "spec.network.interfaces[0].addressesFromPools: Too many")
+	})
+	t.Run("IPv6 nameserver", func(t *testing.T) {
+		expectInvalid(t, v.validate(t, newKubevirtMachine(withNameservers("2001:db8::53"), nil), nil), "spec.network.interfaces[0].nameservers[0]")
+	})
+	t.Run("hostname as nameserver", func(t *testing.T) {
+		expectInvalid(t, v.validate(t, newKubevirtMachine(withNameservers("dns.example.com"), nil), nil), "spec.network.interfaces[0].nameservers[0]")
+	})
+	t.Run("more nameservers than a resolver uses", func(t *testing.T) {
+		expectInvalid(t, v.validate(t, newKubevirtMachine(withNameservers("192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"), nil), nil),
+			"spec.network.interfaces[0].nameservers: Too many")
+	})
+}
+
 func TestKubevirtMachineNetworkCannotBeCombinedWithCloudInitNetworkData(t *testing.T) {
 	v := newCRDValidator(t, "infrastructure.cluster.x-k8s.io_kubevirtmachines.yaml")
 

@@ -23,6 +23,7 @@ import (
 	gocontext "context"
 	"fmt"
 	"net"
+	"net/netip"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -254,23 +255,36 @@ func readAddress(ctx gocontext.Context, c client.Client, claim *ipamv1.IPAddress
 		return Address{}, errors.Wrapf(err, "failed to get IPAddress %s of IPAddressClaim %s", key, claim.Name)
 	}
 
-	ip := net.ParseIP(ipAddress.Spec.Address)
-	if ip == nil || ip.To4() == nil {
-		return Address{}, invalidf("IPAddress %s: %q is not an IPv4 address", key, ipAddress.Spec.Address)
+	ip, err := parseIPv4(ipAddress.Spec.Address)
+	if err != nil {
+		return Address{}, invalidf("IPAddress %s: %v", key, err)
 	}
 	if ipAddress.Spec.Prefix == nil || *ipAddress.Spec.Prefix < 1 || *ipAddress.Spec.Prefix > 32 {
 		return Address{}, invalidf("IPAddress %s: missing or invalid IPv4 prefix", key)
 	}
 
-	addr := Address{IP: ip.To4(), Prefix: int(*ipAddress.Spec.Prefix)}
+	addr := Address{IP: ip, Prefix: int(*ipAddress.Spec.Prefix)}
 	if ipAddress.Spec.Gateway != "" {
-		gw := net.ParseIP(ipAddress.Spec.Gateway)
-		if gw == nil || gw.To4() == nil {
-			return Address{}, invalidf("IPAddress %s: gateway %q is not an IPv4 address", key, ipAddress.Spec.Gateway)
+		gw, err := parseIPv4(ipAddress.Spec.Gateway)
+		if err != nil {
+			return Address{}, invalidf("IPAddress %s: gateway: %v", key, err)
 		}
-		addr.Gateway = gw.To4()
+		addr.Gateway = gw
 	}
 	return addr, nil
+}
+
+// parseIPv4 parses an IPv4 address in dotted decimal notation. IPv6 addresses, IPv4-mapped ones
+// included, are rejected: only IPv4 pools are supported for now.
+func parseIPv4(s string) (net.IP, error) {
+	ip, err := netip.ParseAddr(s)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("%q is not an IP address", s)
+	case !ip.Is4():
+		return nil, fmt.Errorf("%q is an IPv6 address, only IPv4 pools are supported for now", s)
+	}
+	return net.IP(ip.AsSlice()), nil
 }
 
 // OwnedClaims returns the IPAddressClaims controlled by the KubevirtMachine. It goes by ownership,

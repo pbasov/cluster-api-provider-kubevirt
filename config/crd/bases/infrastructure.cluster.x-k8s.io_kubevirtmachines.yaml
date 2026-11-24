@@ -167,6 +167,9 @@ spec:
                   virtual machine in the infra cluster. The claimed addresses are also reported in
                   status.addresses, without relying on the guest agent. The claims are released when the
                   KubevirtMachine is deleted, once its virtual machine is gone.
+                  Only IPv4 is supported for now: one IPv4 address per interface. An IPv6 address
+                  allocated by a pool is reported on the IPAddressClaimed condition with the
+                  IPAddressInvalid reason, and the machine is not provisioned.
                   It cannot be combined with spec.cloudInit.networkData or networkDataSecretRef.
                   Network data is applied during the VM's first boot, so this field's presence and value
                   are immutable on KubevirtMachine after creation.
@@ -185,7 +188,8 @@ spec:
                           description: |-
                             AddressesFromPools references the IPAM pools to claim addresses from, one address
                             per pool. The first claimed address that has a gateway provides the default route.
-                            Only IPv4 pools are supported.
+                            Only one IPv4 pool is supported for now. The field is a list so that a second pool,
+                            for an IPv6 address, can be allowed later without an API change.
                           items:
                             description: |-
                               IPPoolReference references a pool of the Cluster API IPAM contract, in the namespace of the
@@ -214,12 +218,14 @@ spec:
                             - kind
                             - name
                             type: object
+                          maxItems: 1
                           minItems: 1
                           type: array
                         mtu:
                           description: MTU is the MTU configured on the interface
                             in the guest.
                           format: int32
+                          maximum: 65535
                           minimum: 68
                           type: integer
                         name:
@@ -229,15 +235,18 @@ spec:
                           minLength: 1
                           type: string
                         nameservers:
-                          description: Nameservers is a list of DNS servers configured
-                            in the guest.
+                          description: Nameservers is a list of IPv4 addresses of
+                            DNS servers configured in the guest.
                           items:
+                            format: ipv4
                             type: string
+                          maxItems: 3
                           type: array
                       required:
                       - addressesFromPools
                       - name
                       type: object
+                    maxItems: 16
                     minItems: 1
                     type: array
                     x-kubernetes-list-map-keys:

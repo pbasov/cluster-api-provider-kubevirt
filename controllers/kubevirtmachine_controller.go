@@ -284,7 +284,7 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	var staticNetworkData []byte
 	if ctx.KubevirtMachine.Spec.Network != nil {
 		networkData, res, err := r.reconcileStaticNetwork(ctx)
-		if err != nil || !res.IsZero() {
+		if networkData == nil {
 			return res, err
 		}
 		staticNetworkData = networkData
@@ -506,8 +506,8 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 // reconcileStaticNetwork claims the addresses of spec.network from their IPAM pools and, once all
 // of them are allocated, returns the guest network configuration rendered from them, which
 // reconcileKubevirtNetworkDataSecret hands to the guest the same way it hands over
-// spec.cloudInit.networkData. A non-zero result or an error means the machine must not be
-// provisioned yet.
+// spec.cloudInit.networkData. Without network data the machine must not be provisioned yet, and
+// the result and error are those to return from the reconcile.
 func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineContext) ([]byte, ctrl.Result, error) {
 	result, err := ipam.ReconcileClaims(ctx, r.Client, ctx.KubevirtMachine, ctx.Cluster.Name)
 	if err != nil {
@@ -522,8 +522,13 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 			Message: err.Error(),
 		})
 		if ipam.IsInvalidAddress(err) {
-			// Needs a change to the spec or the pool; the KubevirtMachine watch picks up the former.
-			return nil, ctrl.Result{RequeueAfter: time.Minute}, nil
+			// Terminal: retrying cannot help. An allocated IPv6 address, or one without a usable
+			// prefix, stays what it is for as long as its claim exists, and the other causes need a
+			// change to the machine, which the KubevirtMachine watch picks up. Returning an error
+			// would only retry with backoff and feed the error metrics.
+			ctx.Logger.Info("Not provisioning the machine: unusable IP address or spec.network", "reason", err.Error())
+			r.warningEvent(ctx.KubevirtMachine, infrav1.IPAddressInvalidReason, "ClaimIPAddresses", err.Error())
+			return nil, ctrl.Result{}, nil
 		}
 		return nil, ctrl.Result{}, err
 	}

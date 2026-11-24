@@ -9,6 +9,7 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
 )
@@ -195,6 +196,7 @@ func SetupScheme() *runtime.Scheme {
 		corev1.AddToScheme,
 		appsv1.AddToScheme,
 		rbacv1.AddToScheme,
+		ipamv1.AddToScheme,
 	} {
 		if err := f(s); err != nil {
 			panic(err)

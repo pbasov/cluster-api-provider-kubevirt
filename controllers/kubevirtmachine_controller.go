@@ -20,6 +20,7 @@ import (
 	gocontext "context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -31,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	capierrors "sigs.k8s.io/cluster-api/errors" //nolint:staticcheck // deprecated but no replacement yet
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -49,6 +51,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/capiv1beta1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/infracluster"
+	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ipam"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/kubevirt"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ssh"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/workloadcluster"
@@ -79,6 +82,8 @@ func (e *networkDataError) Unwrap() error { return e.err }
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances;,verbs=get;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstancemigrations;,verbs=create
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes;,verbs=get;list;watch
+// +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddresses,verbs=get;list;watch
 
 // Reconcile handles KubevirtMachine events.
 func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
@@ -270,6 +275,12 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	if infraClusterClient == nil {
 		ctx.Logger.Info("Waiting for infra cluster client...")
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if ctx.KubevirtMachine.Spec.Network != nil {
+		if res, err := r.reconcileStaticNetwork(ctx); err != nil || !res.IsZero() {
+			return res, err
+		}
 	}
 
 	if err := r.reconcileKubevirtBootstrapSecret(ctx, infraClusterClient, vmNamespace, clusterNodeSshKeys); err != nil {
@@ -480,6 +491,85 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	return ctrl.Result{}, nil
 }
 
+// reconcileStaticNetwork claims the addresses of spec.network from their IPAM pools and, once all
+// of them are allocated, renders the guest network configuration into the per-machine network data
+// Secret that reconcileKubevirtBootstrapSecret hands to the guest, the same way it hands over
+// spec.cloudInit.networkDataSecretRef. A non-zero result or an error means the machine must not be
+// provisioned yet.
+func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineContext) (ctrl.Result, error) {
+	result, err := ipam.ReconcileClaims(ctx, r.Client, ctx.KubevirtMachine, ctx.Cluster.Name)
+	if err != nil {
+		reason := infrav1.IPAddressClaimFailedReason
+		if ipam.IsInvalidAddress(err) {
+			reason = infrav1.IPAddressInvalidReason
+		}
+		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+			Type:    infrav1.IPAddressClaimedCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: err.Error(),
+		})
+		if ipam.IsInvalidAddress(err) {
+			// Needs a change to the spec or the pool; the KubevirtMachine watch picks up the former.
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	if len(result.Pending) > 0 {
+		ctx.Logger.Info("Waiting for IP addresses to be allocated", "claims", result.Pending)
+		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+			Type:    infrav1.IPAddressClaimedCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  infrav1.WaitingForIPAddressReason,
+			Message: "Waiting for IPAddressClaims: " + strings.Join(result.Pending, ", "),
+		})
+		// The IPAddressClaim watch requeues as soon as an address is bound.
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	networkData, err := ipam.RenderNetworkData(ctx.KubevirtMachine.Spec.CloudInit.GetDataSource(), result.Interfaces)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to render network data")
+	}
+	if err := r.reconcileNetworkDataSecret(ctx, networkData); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+		Type:    infrav1.IPAddressClaimedCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  "IPAddressClaimed",
+		Message: "All IP addresses of spec.network are allocated",
+	})
+	ctx.StaticNetwork = result.Interfaces
+	return ctrl.Result{}, nil
+}
+
+// reconcileNetworkDataSecret writes the network data rendered from spec.network to the per-machine
+// Secret, owned by the KubevirtMachine, under the "networkdata" key.
+func (r *KubevirtMachineReconciler) reconcileNetworkDataSecret(ctx *context.MachineContext, networkData []byte) error {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ipam.NetworkDataSecretName(ctx.KubevirtMachine.Name),
+			Namespace: ctx.KubevirtMachine.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if secret.Labels == nil {
+			secret.Labels = map[string]string{}
+		}
+		secret.Labels[clusterv1.ClusterNameLabel] = ctx.Cluster.Name
+		secret.Type = clusterv1.ClusterSecretType
+		secret.Data = map[string][]byte{"networkdata": networkData}
+		return controllerutil.SetControllerReference(ctx.KubevirtMachine, secret, r.Scheme())
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to write network data secret for KubevirtMachine %s/%s", ctx.KubevirtMachine.Namespace, ctx.KubevirtMachine.Name)
+	}
+	return nil
+}
+
 func machineHasKnownInternalIP(kubevirtMachine *infrav1.KubevirtMachine) bool {
 	for _, addr := range kubevirtMachine.Status.Addresses {
 		if addr.Type == clusterv1.MachineInternalIP && addr.Address != "" {
@@ -579,6 +669,19 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		}
 	}
 
+	if ctx.KubevirtMachine.Spec.Network != nil {
+		// Keep the claimed addresses until the VM that uses them is gone, so that a
+		// replacement machine can never be handed an address that is still in use.
+		if externalMachine.Exists() {
+			ctx.Logger.Info("Waiting for the VM to be deleted before releasing its IP addresses...")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		ctx.Logger.Info("Releasing IP addresses...")
+		if err := ipam.ReleaseClaims(ctx, r.Client, ctx.KubevirtMachine); err != nil {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to release IP address claims")
+		}
+	}
+
 	// Machine is deleted so remove the finalizer.
 	controllerutil.RemoveFinalizer(ctx.KubevirtMachine, infrav1.MachineFinalizer)
 
@@ -622,6 +725,7 @@ func (r *KubevirtMachineReconciler) SetupWithManager(goctx gocontext.Context, mg
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.SecretToKubevirtMachines),
 		).
+		Owns(&ipamv1.IPAddressClaim{}).
 		Watches(
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(clusterToKubevirtMachines),
@@ -651,7 +755,8 @@ func (r *KubevirtMachineReconciler) SecretToKubevirtMachines(ctx gocontext.Conte
 	for i := range machineList.Items {
 		machine := &machineList.Items[i]
 		ref := machine.Spec.CloudInit.GetNetworkDataSecretRef()
-		if ref != nil && ref.Name == secret.Name {
+		if ref != nil && ref.Name == secret.Name ||
+			machine.Spec.Network != nil && ipam.NetworkDataSecretName(machine.Name) == secret.Name {
 			requests = append(requests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(machine)})
 		}
 	}
@@ -767,6 +872,11 @@ func (r *KubevirtMachineReconciler) getNetworkData(ctx *context.MachineContext) 
 	}
 
 	ref := ctx.KubevirtMachine.Spec.CloudInit.GetNetworkDataSecretRef()
+	if ctx.KubevirtMachine.Spec.Network != nil {
+		// The configuration rendered from spec.network takes the same path as a user-provided
+		// networkDataSecretRef; the API rejects combining the two.
+		ref = &corev1.LocalObjectReference{Name: ipam.NetworkDataSecretName(ctx.KubevirtMachine.Name)}
+	}
 	if ref == nil {
 		return nil, nil
 	}

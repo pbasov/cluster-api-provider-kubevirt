@@ -35,6 +35,7 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint SA1019
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/flags"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -88,6 +89,7 @@ func registerScheme() (*runtime.Scheme, error) {
 		infrav1.AddToScheme,
 		clusterv1.AddToScheme,
 		clusterv1beta1.AddToScheme,
+		ipamv1.AddToScheme,
 		kubevirtv1.AddToScheme,
 		cdiv1.AddToScheme,
 		apiextensionsv1.AddToScheme,

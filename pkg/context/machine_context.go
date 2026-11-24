@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/patch"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
+	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ipam"
 )
 
 // MachineContext is a Go context used with a KubeVirt machine.
@@ -40,6 +41,10 @@ type MachineContext struct {
 	KubevirtMachine     *infrav1.KubevirtMachine
 	BootstrapDataSecret *corev1.Secret
 	Logger              logr.Logger
+
+	// StaticNetwork holds the guest network configuration built from the addresses claimed for
+	// spec.network. It is nil when spec.network is unset.
+	StaticNetwork []ipam.InterfaceConfig
 }
 
 // ClusterContext returns cluster context from this machine context
@@ -83,6 +88,7 @@ func (c *MachineContext) PatchKubevirtMachine(patchHelper *patch.Helper) error {
 			clusterv1.ReadyCondition,
 			infrav1.VMProvisionedCondition,
 			infrav1.BootstrapExecSucceededCondition,
+			infrav1.IPAddressClaimedCondition,
 		}},
 	)
 }

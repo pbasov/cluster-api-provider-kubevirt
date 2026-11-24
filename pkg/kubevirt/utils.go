@@ -27,6 +27,7 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/capiv1beta1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ipam"
 )
 
 type CommandExecutor interface {
@@ -149,9 +150,14 @@ func buildVirtualMachineInstanceTemplate(ctx *context.MachineContext) *kubevirtv
 	// The network data is copied into the same secret as the user data. KubeVirt mounts each
 	// reference into its own pod volume, so pointing both references at one secret is safe.
 	var networkDataSecretRef *corev1.LocalObjectReference
-	if ctx.KubevirtMachine.Spec.CloudInit.GetNetworkDataSecretRef() != nil || ctx.KubevirtMachine.Spec.CloudInit.GetNetworkData() != nil {
+	if ctx.KubevirtMachine.Spec.CloudInit.GetNetworkDataSecretRef() != nil || ctx.KubevirtMachine.Spec.CloudInit.GetNetworkData() != nil ||
+		ctx.KubevirtMachine.Spec.Network != nil {
 		networkDataSecretRef = &corev1.LocalObjectReference{Name: cloudInitSecretName}
 	}
+
+	// The configuration rendered from spec.network matches the interfaces by MAC address, so
+	// the MAC addresses it expects are pinned on the interfaces.
+	pinInterfaceMACAddresses(template.Spec.Domain.Devices.Interfaces, ctx.StaticNetwork)
 
 	var cloudInitVolumeSource kubevirtv1.VolumeSource
 	if ctx.KubevirtMachine.Spec.CloudInit.GetDataSource() == infrav1.CloudInitDataSourceNoCloud {
@@ -191,4 +197,16 @@ func nodeRole(ctx *context.MachineContext) string {
 		return constants.ControlPlaneNodeRoleValue
 	}
 	return constants.WorkerNodeRoleValue
+}
+
+// pinInterfaceMACAddresses sets the MAC address of every interface that has a static
+// configuration and no MAC address of its own.
+func pinInterfaceMACAddresses(interfaces []kubevirtv1.Interface, staticNetwork []ipam.InterfaceConfig) {
+	for _, cfg := range staticNetwork {
+		for i := range interfaces {
+			if interfaces[i].Name == cfg.Name && interfaces[i].MacAddress == "" {
+				interfaces[i].MacAddress = cfg.MACAddress
+			}
+		}
+	}
 }

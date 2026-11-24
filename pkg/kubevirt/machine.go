@@ -228,8 +228,13 @@ func (m *Machine) hasReadyCondition() bool {
 	return false
 }
 
-// Address returns the IP address of the VM.
+// Address returns the IP address of the VM. When spec.network is set, this is the first address
+// claimed from IPAM; otherwise it is the address the VMI reports on its first interface.
 func (m *Machine) Address() string {
+	if addresses := m.staticAddresses(); len(addresses) > 0 {
+		return addresses[0]
+	}
+
 	if m.vmiInstance != nil && len(m.vmiInstance.Status.Interfaces) > 0 {
 		return m.vmiInstance.Status.Interfaces[0].IP
 	}
@@ -238,8 +243,14 @@ func (m *Machine) Address() string {
 }
 
 // Addresses returns all IP addresses of the VM (for dual-stack support).
-// It collects IPs from all network interfaces, supporting both IPv4 and IPv6.
+// When spec.network is set, these are the addresses claimed from IPAM, which are known without
+// the guest agent; otherwise it collects IPs from all network interfaces of the VMI, supporting
+// both IPv4 and IPv6.
 func (m *Machine) Addresses() []string {
+	if addresses := m.staticAddresses(); len(addresses) > 0 {
+		return addresses
+	}
+
 	if m.vmiInstance == nil {
 		return nil
 	}
@@ -247,6 +258,20 @@ func (m *Machine) Addresses() []string {
 	var addresses []string
 	for _, iface := range m.vmiInstance.Status.Interfaces {
 		addresses = append(addresses, iface.IPs...)
+	}
+	return addresses
+}
+
+// staticAddresses returns the addresses claimed for spec.network, in interface and pool order.
+func (m *Machine) staticAddresses() []string {
+	if m.machineContext == nil {
+		return nil
+	}
+	var addresses []string
+	for _, iface := range m.machineContext.StaticNetwork {
+		for _, addr := range iface.Addresses {
+			addresses = append(addresses, addr.IP.String())
+		}
 	}
 	return addresses
 }

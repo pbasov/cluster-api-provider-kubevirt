@@ -10,6 +10,7 @@ import (
 	kubeadmv1beta2 "sigs.k8s.io/cluster-api/api/bootstrap/kubeadm/v1beta2"
 	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint:staticcheck // needed for scheme registration
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -77,6 +78,11 @@ func initClients() error {
 		err = kubeadmv1beta2.AddToScheme(s)
 		if err != nil {
 			err = fmt.Errorf("failed to setup scheme for kubeadmv1beta2; %w", err)
+		}
+
+		err = ipamv1.AddToScheme(s)
+		if err != nil {
+			err = fmt.Errorf("failed to setup scheme for ipamv1; %w", err)
 		}
 	})
 

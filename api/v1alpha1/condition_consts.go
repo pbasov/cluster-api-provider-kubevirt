@@ -80,6 +80,10 @@ const (
 	// IPAddressInvalidReason (Severity=Error) documents a KubevirtMachine whose allocated IPAddress
 	// cannot be used, e.g. an IPv6 address or a malformed prefix.
 	IPAddressInvalidReason = "IPAddressInvalid"
+
+	// IPAMFeatureDisabledReason (Severity=Error) documents a KubevirtMachine with spec.network that
+	// is not provisioned because the KubevirtIPAM feature gate of the manager is disabled.
+	IPAMFeatureDisabledReason = "IPAMFeatureDisabled"
 )
 
 // Conditions and condition Reasons for the KubevirtCluster object

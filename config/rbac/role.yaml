@@ -49,6 +49,13 @@ rules:
   - list
   - watch
 - apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
   - kubevirtclusters
@@ -75,26 +82,6 @@ rules:
   - infrastructure.cluster.x-k8s.io
   resources:
   - kubevirtmachinetemplates
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ipam.cluster.x-k8s.io
-  resources:
-  - ipaddressclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ipam.cluster.x-k8s.io
-  resources:
-  - ipaddresses
   verbs:
   - get
   - list

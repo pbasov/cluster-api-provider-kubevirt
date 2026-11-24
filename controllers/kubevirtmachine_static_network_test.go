@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -59,6 +60,7 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		// infraClient is the infra cluster client; it is c unless the test sets up an external
 		// infra cluster.
 		infraClient client.Client
+		recorder    *events.FakeRecorder
 	)
 
 	lanPool := ipamv1.IPPoolReference{APIGroup: "ipam.cluster.x-k8s.io", Kind: "InClusterIPPool", Name: "pool"}
@@ -124,11 +126,14 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 			infraClient = c
 		}
 		machineContext = newMachineContext(machine, kubevirtMachine)
+		recorder = events.NewFakeRecorder(10)
 		reconciler = KubevirtMachineReconciler{
 			Client:          c,
 			InfraCluster:    infraClusterMock,
 			WorkloadCluster: workloadclustermock.NewMockWorkloadCluster(gomock.NewController(GinkgoT())),
 			MachineFactory:  kubevirt.DefaultMachineFactory{},
+			IPAMEnabled:     true,
+			Recorder:        recorder,
 		}
 		infraClusterMock.EXPECT().GenerateInfraClusterClient(gomock.Any(), gomock.Any(), gomock.Any()).Return(infraClient, kubevirtMachine.Namespace, nil).AnyTimes()
 	}
@@ -192,6 +197,31 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		ExpectWithOffset(1, cl.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: name}, secret)).To(Succeed())
 		return secret
 	}
+
+	It("does not provision the machine when the KubevirtIPAM feature gate is disabled", func() {
+		setup()
+		reconciler.IPAMEnabled = false
+
+		out, err := reconciler.reconcileNormal(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{}))
+
+		for _, conditionType := range []string{infrav1.IPAddressClaimedCondition, infrav1.VMProvisionedCondition} {
+			cond := conditions.Get(kubevirtMachine, conditionType)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(infrav1.IPAMFeatureDisabledReason))
+			Expect(cond.Message).To(ContainSubstring("--feature-gates=KubevirtIPAM=true"))
+		}
+		Expect(recorder.Events).To(Receive(And(ContainSubstring("Warning"), ContainSubstring(infrav1.IPAMFeatureDisabledReason))))
+
+		// Nothing is claimed, read or created.
+		claims := &ipamv1.IPAddressClaimList{}
+		Expect(c.List(gocontext.Background(), claims)).To(Succeed())
+		Expect(claims.Items).To(BeEmpty())
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}, &kubevirtv1.VirtualMachine{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
 
 	It("claims an address and does not create the VM until it is allocated", func() {
 		setup()

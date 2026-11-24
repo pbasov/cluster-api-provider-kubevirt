@@ -1,0 +1,21 @@
+# Opt-in component for static guest addresses from Cluster API IPAM pools (KubevirtMachine
+# spec.network). It grants the manager the ipam.cluster.x-k8s.io rules that the base manager role
+# deliberately does not have, and enables the KubevirtIPAM feature gate.
+#
+# Add it to the kustomization that builds the provider, next to its resources, e.g. in
+# config/default/kustomization.yaml:
+#
+#   components:
+#   - ../components/ipam
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+- role.yaml
+- role_binding.yaml
+patches:
+- path: manager_feature_gate_patch.yaml
+  target:
+    group: apps
+    version: v1
+    kind: Deployment
+    labelSelector: control-plane=controller-manager

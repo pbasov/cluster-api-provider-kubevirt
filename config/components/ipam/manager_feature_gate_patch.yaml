@@ -1,0 +1,4 @@
+# A repeated --feature-gates flag adds to the gates set by the earlier ones.
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --feature-gates=KubevirtIPAM=true

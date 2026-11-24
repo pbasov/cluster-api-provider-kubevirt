@@ -36,7 +36,7 @@ import (
 	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1" //nolint SA1019
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
-	"sigs.k8s.io/cluster-api/feature"
+	capifeature "sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/flags"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -47,6 +47,7 @@ import (
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/controllers"
+	"sigs.k8s.io/cluster-api-provider-kubevirt/feature"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/annotationfilter"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/infracluster"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/kubevirt"
@@ -84,17 +85,22 @@ func init() {
 func registerScheme() (*runtime.Scheme, error) {
 	myscheme := runtime.NewScheme()
 
-	for _, f := range []func(*runtime.Scheme) error{
+	addToScheme := []func(*runtime.Scheme) error{
 		scheme.AddToScheme,
 		infrav1.AddToScheme,
 		clusterv1.AddToScheme,
 		clusterv1beta1.AddToScheme,
-		ipamv1.AddToScheme,
 		kubevirtv1.AddToScheme,
 		cdiv1.AddToScheme,
 		apiextensionsv1.AddToScheme,
 		// +kubebuilder:scaffold:scheme
-	} {
+	}
+	if feature.Gates.Enabled(feature.KubevirtIPAM) {
+		// Registered only with the gate, so that nothing can read IPAM objects without it.
+		addToScheme = append(addToScheme, ipamv1.AddToScheme)
+	}
+
+	for _, f := range addToScheme {
 		if err := f(myscheme); err != nil {
 			return nil, err
 		}
@@ -132,7 +138,7 @@ func initFlags(fs *pflag.FlagSet) {
 	fs.StringSliceVar(&excludeAnnotations, "exclude-annotations", nil,
 		"Comma-separated list of annotation names. Objects carrying any of these annotations are excluded from reconciliation and webhook validation.")
 
-	feature.MutableGates.AddFlag(fs)
+	capifeature.MutableGates.AddFlag(fs)
 
 	flags.AddManagerOptions(fs, &managerOptions)
 }
@@ -243,6 +249,8 @@ func setupReconcilers(ctx context.Context, mgr ctrl.Manager, excludedAnnotations
 		WorkloadCluster:     workloadcluster.New(mgr.GetClient()),
 		MachineFactory:      kubevirt.DefaultMachineFactory{},
 		ExcludedAnnotations: excludedAnnotations,
+		IPAMEnabled:         feature.Gates.Enabled(feature.KubevirtIPAM),
+		Recorder:            mgr.GetEventRecorder("kubevirtmachine-controller"),
 	}).SetupWithManager(ctx, mgr, controller.Options{
 		MaxConcurrentReconciles: concurrency,
 	}, ctrl.Log.WithName("controllers").WithName("KubevirtMachine")); err != nil {

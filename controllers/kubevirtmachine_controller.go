@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	capierrors "sigs.k8s.io/cluster-api/errors" //nolint:staticcheck // deprecated but no replacement yet
@@ -64,18 +65,26 @@ type KubevirtMachineReconciler struct {
 	WorkloadCluster     workloadcluster.WorkloadCluster
 	MachineFactory      kubevirt.MachineFactory
 	ExcludedAnnotations annotationfilter.Filter
+	// IPAMEnabled is set when the KubevirtIPAM feature gate is enabled. Only then does the controller
+	// watch IPAddressClaims and provision machines with spec.network.
+	IPAMEnabled bool
+	// Recorder emits the events of the controller. It may be nil, in which case no event is emitted.
+	Recorder events.EventRecorder
 }
+
+// The rules for ipam.cluster.x-k8s.io are deliberately not generated into the manager role: they are
+// needed only with the KubevirtIPAM feature gate and come with the config/components/ipam
+// kustomize component.
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtmachines,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtmachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machines,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets;,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances;,verbs=get;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstancemigrations;,verbs=create
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes;,verbs=get;list;watch
-// +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddressclaims,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=ipaddresses,verbs=get;list;watch
 
 // Reconcile handles KubevirtMachine events.
 func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.Request) (_ ctrl.Result, rerr error) {
@@ -205,6 +214,9 @@ func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.
 }
 
 func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext) (res ctrl.Result, retErr error) {
+	if ctx.KubevirtMachine.Spec.Network != nil && !r.IPAMEnabled {
+		return r.reconcileIPAMDisabled(ctx)
+	}
 
 	// Make sure bootstrap data is available and populated.
 	if ctx.Machine.Spec.Bootstrap.DataSecretName == nil {
@@ -543,6 +555,37 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 	return networkData, ctrl.Result{}, nil
 }
 
+// reconcileIPAMDisabled reports a KubevirtMachine with spec.network that cannot be provisioned
+// because the KubevirtIPAM feature gate is disabled. Nothing changes until the manager is restarted
+// with the gate, which reconciles every machine again, so the machine is not requeued.
+func (r *KubevirtMachineReconciler) reconcileIPAMDisabled(ctx *context.MachineContext) (ctrl.Result, error) {
+	const message = "spec.network is set, but the KubevirtIPAM feature gate of the KubeVirt infrastructure provider is disabled; " +
+		"enable it with --feature-gates=KubevirtIPAM=true, or remove spec.network"
+	ctx.Logger.Info("Not provisioning the machine: " + message)
+	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+		Type:    infrav1.IPAddressClaimedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.IPAMFeatureDisabledReason,
+		Message: message,
+	})
+	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+		Type:    infrav1.VMProvisionedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.IPAMFeatureDisabledReason,
+		Message: message,
+	})
+	r.warningEvent(ctx.KubevirtMachine, infrav1.IPAMFeatureDisabledReason, "ClaimIPAddresses", message)
+	return ctrl.Result{}, nil
+}
+
+// warningEvent emits a Warning event about a KubevirtMachine, when the reconciler has a recorder.
+func (r *KubevirtMachineReconciler) warningEvent(kubevirtMachine *infrav1.KubevirtMachine, reason, action, note string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(kubevirtMachine, nil, corev1.EventTypeWarning, reason, action, "%s", note)
+}
+
 func machineHasKnownInternalIP(kubevirtMachine *infrav1.KubevirtMachine) bool {
 	for _, addr := range kubevirtMachine.Status.Addresses {
 		if addr.Type == clusterv1.MachineInternalIP && addr.Address != "" {
@@ -647,7 +690,11 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		}
 	}
 
-	if ctx.KubevirtMachine.Spec.Network != nil {
+	if ctx.KubevirtMachine.Spec.Network != nil && !r.IPAMEnabled {
+		// Without the gate there is neither the RBAC nor, possibly, the API to touch claims. A
+		// machine admitted while the gate is disabled never had any.
+		ctx.Logger.Info("The KubevirtIPAM feature gate is disabled, not releasing IP address claims of spec.network")
+	} else if ctx.KubevirtMachine.Spec.Network != nil {
 		// Keep the claimed addresses until the VM that uses them is gone, so that a
 		// replacement machine can never be handed an address that is still in use.
 		if externalMachine.Exists() {
@@ -703,12 +750,17 @@ func (r *KubevirtMachineReconciler) SetupWithManager(goctx gocontext.Context, mg
 			&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.SecretToKubevirtMachines),
 		).
-		Owns(&ipamv1.IPAddressClaim{}).
 		Watches(
 			&clusterv1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(clusterToKubevirtMachines),
 			builder.WithPredicates(predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(r.Scheme(), ctrl.LoggerFrom(goctx))),
 		)
+
+	if r.IPAMEnabled {
+		// Only with the gate: the watch needs the IPAddressClaim API and RBAC on it, and the
+		// manager does not start without them.
+		controllerBuilder = controllerBuilder.Owns(&ipamv1.IPAddressClaim{})
+	}
 
 	if !r.ExcludedAnnotations.IsEmpty() {
 		controllerBuilder = controllerBuilder.WithEventFilter(r.ExcludedAnnotations.Predicate())

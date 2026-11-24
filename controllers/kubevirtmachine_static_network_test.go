@@ -84,7 +84,7 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		kubevirtMachine.Spec.Network = &infrav1.NetworkSpec{
 			Interfaces: []infrav1.NetworkInterfaceSpec{{
 				Name:               "lan",
-				AddressesFromPools: []corev1.TypedLocalObjectReference{{APIGroup: ptr.To(lanPool.APIGroup), Kind: lanPool.Kind, Name: lanPool.Name}},
+				AddressesFromPools: []infrav1.IPPoolReference{{APIGroup: lanPool.APIGroup, Kind: lanPool.Kind, Name: lanPool.Name}},
 				Nameservers:        []string{"192.0.2.53"},
 			}},
 		}

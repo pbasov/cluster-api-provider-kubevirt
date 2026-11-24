@@ -82,25 +82,35 @@ func newCRDValidator(t *testing.T, file string) *crdValidator {
 func (v *crdValidator) validate(t *testing.T, obj, old runtime.Object) field.ErrorList {
 	t.Helper()
 
-	toUnstructured := func(o runtime.Object) map[string]interface{} {
-		u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return u
-	}
-
-	newObj := toUnstructured(obj)
-	var oldObj interface{}
-	var errs field.ErrorList
 	if old == nil {
+		return v.validateUnstructured(toUnstructured(t, obj), nil)
+	}
+	return v.validateUnstructured(toUnstructured(t, obj), toUnstructured(t, old))
+}
+
+// validateUnstructured is validate for objects that the API types cannot express, such as
+// objects without a required field.
+func (v *crdValidator) validateUnstructured(newObj, oldObj map[string]interface{}) field.ErrorList {
+	var errs field.ErrorList
+	var old interface{}
+	if oldObj == nil {
 		errs = apiservervalidation.ValidateCustomResource(nil, newObj, v.schema)
 	} else {
-		oldObj = toUnstructured(old)
+		old = oldObj
 		errs = apiservervalidation.ValidateCustomResourceUpdate(nil, newObj, oldObj, v.schema)
 	}
-	celErrs, _ := cel.NewValidator(v.structural, true, celPerCallLimit).Validate(context.Background(), nil, v.structural, newObj, oldObj, celCostBudget)
+	celErrs, _ := cel.NewValidator(v.structural, true, celPerCallLimit).Validate(context.Background(), nil, v.structural, newObj, old, celCostBudget)
 	return append(errs, celErrs...)
+}
+
+func toUnstructured(t *testing.T, o runtime.Object) map[string]interface{} {
+	t.Helper()
+
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }
 
 func expectValid(t *testing.T, errs field.ErrorList) {
@@ -132,12 +142,32 @@ func newKubevirtMachine(network *infrav1.NetworkSpec, cloudInit *infrav1.CloudIn
 func lanNetwork(pool string) *infrav1.NetworkSpec {
 	return &infrav1.NetworkSpec{Interfaces: []infrav1.NetworkInterfaceSpec{{
 		Name: "lan",
-		AddressesFromPools: []corev1.TypedLocalObjectReference{{
-			APIGroup: ptr.To("ipam.cluster.x-k8s.io"),
+		AddressesFromPools: []infrav1.IPPoolReference{{
+			APIGroup: "ipam.cluster.x-k8s.io",
 			Kind:     "InClusterIPPool",
 			Name:     pool,
 		}},
 	}}}
+}
+
+func TestKubevirtMachinePoolReferenceRequiresAllFields(t *testing.T) {
+	v := newCRDValidator(t, "infrastructure.cluster.x-k8s.io_kubevirtmachines.yaml")
+
+	expectValid(t, v.validate(t, newKubevirtMachine(lanNetwork("pool"), nil), nil))
+
+	for _, fieldName := range []string{"apiGroup", "kind", "name"} {
+		t.Run("missing "+fieldName, func(t *testing.T) {
+			obj := toUnstructured(t, newKubevirtMachine(lanNetwork("pool"), nil))
+			network := obj["spec"].(map[string]interface{})["network"].(map[string]interface{})
+			iface := network["interfaces"].([]interface{})[0].(map[string]interface{})
+			pool := iface["addressesFromPools"].([]interface{})[0].(map[string]interface{})
+			delete(pool, fieldName)
+			expectInvalid(t, v.validateUnstructured(obj, nil), "spec.network.interfaces[0].addressesFromPools[0]."+fieldName+": Required value")
+
+			pool[fieldName] = ""
+			expectInvalid(t, v.validateUnstructured(obj, nil), "spec.network.interfaces[0].addressesFromPools[0]."+fieldName+": Invalid value")
+		})
+	}
 }
 
 func TestKubevirtMachineNetworkCannotBeCombinedWithCloudInitNetworkData(t *testing.T) {

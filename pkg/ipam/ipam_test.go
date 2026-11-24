@@ -77,16 +77,16 @@ func newKubevirtMachine(templateMAC string, network *infrav1.NetworkSpec) *infra
 	}
 }
 
-func poolRef() corev1.TypedLocalObjectReference {
-	return corev1.TypedLocalObjectReference{
-		APIGroup: ptr.To("ipam.cluster.x-k8s.io"),
+func poolRef() infrav1.IPPoolReference {
+	return infrav1.IPPoolReference{
+		APIGroup: "ipam.cluster.x-k8s.io",
 		Kind:     "InClusterIPPool",
 		Name:     testPool,
 	}
 }
 
 func lanNetwork(pools int) *infrav1.NetworkSpec {
-	refs := make([]corev1.TypedLocalObjectReference, pools)
+	refs := make([]infrav1.IPPoolReference, pools)
 	for i := range refs {
 		refs[i] = poolRef()
 	}
@@ -276,7 +276,7 @@ func TestReconcileClaimsInvalid(t *testing.T) {
 		{
 			name: "interface missing from the template",
 			network: &infrav1.NetworkSpec{Interfaces: []infrav1.NetworkInterfaceSpec{{
-				Name: "other", AddressesFromPools: []corev1.TypedLocalObjectReference{poolRef()},
+				Name: "other", AddressesFromPools: []infrav1.IPPoolReference{poolRef()},
 			}}},
 		},
 		{
@@ -341,7 +341,7 @@ func TestReleaseClaims(t *testing.T) {
 	// Claims are released by ownership, so the ones spec.network no longer lists do not leak.
 	for name, network := range map[string]*infrav1.NetworkSpec{
 		"interface still in spec.network":   lanNetwork(1),
-		"interface gone from spec.network":  {Interfaces: []infrav1.NetworkInterfaceSpec{{Name: "other", AddressesFromPools: []corev1.TypedLocalObjectReference{poolRef()}}}},
+		"interface gone from spec.network":  {Interfaces: []infrav1.NetworkInterfaceSpec{{Name: "other", AddressesFromPools: []infrav1.IPPoolReference{poolRef()}}}},
 		"spec.network removed after claims": nil,
 	} {
 		t.Run(name, func(t *testing.T) {

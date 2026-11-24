@@ -184,7 +184,7 @@ type NetworkInterfaceSpec struct {
 	// per pool. The first claimed address that has a gateway provides the default route.
 	// Only IPv4 pools are supported.
 	// +kubebuilder:validation:MinItems=1
-	AddressesFromPools []corev1.TypedLocalObjectReference `json:"addressesFromPools"`
+	AddressesFromPools []IPPoolReference `json:"addressesFromPools"`
 
 	// Nameservers is a list of DNS servers configured in the guest.
 	// +optional
@@ -194,6 +194,29 @@ type NetworkInterfaceSpec struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=68
 	MTU *int32 `json:"mtu,omitempty"`
+}
+
+// IPPoolReference references a pool of the Cluster API IPAM contract, in the namespace of the
+// KubevirtMachine. Every field is required, as in the poolRef of an IPAddressClaim, which is
+// created from it.
+type IPPoolReference struct {
+	// APIGroup is the API group of the pool, for example ipam.cluster.x-k8s.io.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	APIGroup string `json:"apiGroup"`
+
+	// Kind is the kind of the pool, for example InClusterIPPool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Kind string `json:"kind"`
+
+	// Name is the name of the pool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
 }
 
 // VirtualMachineBootstrapCheckSpec defines how the controller will remotely check CAPI Sentinel file content.

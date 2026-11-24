@@ -192,28 +192,32 @@ spec:
                                     Only IPv4 pools are supported.
                                   items:
                                     description: |-
-                                      TypedLocalObjectReference contains enough information to let you locate the
-                                      typed referenced object inside the same namespace.
+                                      IPPoolReference references a pool of the Cluster API IPAM contract, in the namespace of the
+                                      KubevirtMachine. Every field is required, as in the poolRef of an IPAddressClaim, which is
+                                      created from it.
                                     properties:
                                       apiGroup:
-                                        description: |-
-                                          APIGroup is the group for the resource being referenced.
-                                          If APIGroup is not specified, the specified Kind must be in the core API group.
-                                          For any other third-party types, APIGroup is required.
+                                        description: APIGroup is the API group of
+                                          the pool, for example ipam.cluster.x-k8s.io.
+                                        maxLength: 253
+                                        minLength: 1
                                         type: string
                                       kind:
-                                        description: Kind is the type of resource
-                                          being referenced
+                                        description: Kind is the kind of the pool,
+                                          for example InClusterIPPool.
+                                        maxLength: 63
+                                        minLength: 1
                                         type: string
                                       name:
-                                        description: Name is the name of resource
-                                          being referenced
+                                        description: Name is the name of the pool.
+                                        maxLength: 253
+                                        minLength: 1
                                         type: string
                                     required:
+                                    - apiGroup
                                     - kind
                                     - name
                                     type: object
-                                    x-kubernetes-map-type: atomic
                                   minItems: 1
                                   type: array
                                 mtu:

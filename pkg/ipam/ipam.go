@@ -149,10 +149,7 @@ func ReconcileClaims(ctx gocontext.Context, c client.Client, kubevirtMachine *in
 
 		bound := true
 		for i, poolRef := range ifaceSpec.AddressesFromPools {
-			pool := ipamv1.IPPoolReference{Kind: poolRef.Kind, Name: poolRef.Name}
-			if poolRef.APIGroup != nil {
-				pool.APIGroup = *poolRef.APIGroup
-			}
+			pool := ipamv1.IPPoolReference{APIGroup: poolRef.APIGroup, Kind: poolRef.Kind, Name: poolRef.Name}
 			claim, err := ensureClaim(ctx, c, kubevirtMachine, clusterName, ClaimName(kubevirtMachine.Name, ifaceSpec.Name, i), pool)
 			if err != nil {
 				return nil, err

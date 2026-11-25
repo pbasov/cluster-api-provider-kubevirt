@@ -474,6 +474,12 @@ func (m *Machine) Delete() error {
 	}
 
 	if err := m.infraClient.Delete(gocontext.Background(), vm); err != nil {
+		// The VM can be gone already although Get found it: the client may read from a cache
+		// that has not seen the deletion yet.
+		if apierrors.IsNotFound(err) {
+			m.machineContext.Logger.Info("VM does not exist, nothing to do.")
+			return nil
+		}
 		return errors.Wrapf(err, "failed to delete VM")
 	}
 

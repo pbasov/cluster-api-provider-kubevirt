@@ -141,7 +141,7 @@ func (r *KubevirtClusterReconciler) Reconcile(goctx gocontext.Context, req ctrl.
 	// Always attempt to Patch the KubevirtCluster object and status after each reconciliation.
 	defer func() {
 		if err := clusterContext.PatchKubevirtCluster(patchHelper); err != nil {
-			if err = r.filterOutNotFoundError(err); err != nil {
+			if err = filterOutNotFoundError(err); err != nil {
 
 				clusterContext.Logger.Error(err, "failed to patch KubevirtCluster")
 				if rerr == nil {
@@ -344,7 +344,10 @@ func (r *KubevirtClusterReconciler) deleteExtraGVK(ctx *context.ClusterContext, 
 	return nil
 }
 
-func (r *KubevirtClusterReconciler) filterOutNotFoundError(err error) error {
+// filterOutNotFoundError drops the errors that only report an object as not found, also from the
+// aggregate that the Cluster API patch helper wraps the errors of its requests in, which
+// apierrors.IsNotFound does not look into.
+func filterOutNotFoundError(err error) error {
 	if err == nil {
 		return nil
 	}

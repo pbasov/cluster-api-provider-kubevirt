@@ -460,6 +460,21 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(kubevirtMachine.Finalizers).NotTo(ContainElement(infrav1.MachineFinalizer))
 	})
 
+	It("does not fail when the KubevirtMachine is gone before the deletion patches it", func() {
+		setup()
+		// An earlier reconcile removed the finalizer and the object is gone, but this reconcile
+		// still works on the copy from the cache.
+		stored := &infrav1.KubevirtMachine{}
+		Expect(c.Get(gocontext.Background(), client.ObjectKeyFromObject(kubevirtMachine), stored)).To(Succeed())
+		stored.Finalizers = nil
+		Expect(c.Update(gocontext.Background(), stored)).To(Succeed())
+		Expect(c.Delete(gocontext.Background(), stored)).To(Succeed())
+
+		out, err := reconciler.reconcileDelete(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{}))
+	})
+
 	It("writes only the userdata when spec.network is unset", func() {
 		kubevirtMachine.Spec.Network = nil
 		setup()

@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/events"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
@@ -778,7 +777,9 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		Message: "KubevirtMachine deletion has started",
 	})
 	if err := ctx.PatchKubevirtMachine(patchHelper); err != nil {
-		if err = utilerrors.FilterOut(err, apierrors.IsNotFound); err != nil {
+		// The KubevirtMachine is gone once its last finalizer is removed, possibly already by an
+		// earlier reconcile that the cache has not caught up with yet.
+		if err = filterOutNotFoundError(err); err != nil {
 			return ctrl.Result{}, errors.Wrap(err, "failed to patch KubevirtMachine")
 		}
 	}

@@ -536,10 +536,11 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 	if len(result.Pending) > 0 {
 		ctx.Logger.Info("Waiting for IP addresses to be allocated", "claims", result.Pending)
 		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
-			Type:    infrav1.IPAddressClaimedCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  infrav1.WaitingForIPAddressReason,
-			Message: "Waiting for IPAddressClaims: " + strings.Join(result.Pending, ", "),
+			Type:   infrav1.IPAddressClaimedCondition,
+			Status: metav1.ConditionFalse,
+			Reason: infrav1.WaitingForIPAddressReason,
+			Message: "Waiting for IPAddressClaims: " + strings.Join(result.Pending, "; ") +
+				". If this persists, check that the pool has a free address and that its IPAM provider is running",
 		})
 		// The IPAddressClaim watch requeues as soon as an address is bound.
 		return nil, ctrl.Result{RequeueAfter: 30 * time.Second}, nil

@@ -242,7 +242,9 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(infrav1.WaitingForIPAddressReason))
-		Expect(cond.Message).To(ContainSubstring(claimName))
+		Expect(cond.Message).To(ContainSubstring(claimName + " from InClusterIPPool pool"))
+		Expect(cond.Message).To(ContainSubstring("no reason reported by the IPAM provider"))
+		Expect(cond.Message).To(ContainSubstring("check that the pool has a free address"))
 	})
 
 	It("creates the VM with a static network configuration once the address is allocated", func() {

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -94,8 +95,8 @@ type Result struct {
 	// Interfaces holds the configuration of every interface in spec.network, once all
 	// addresses are allocated.
 	Interfaces []InterfaceConfig
-	// Pending names the claims that are not bound to an address yet, with the reason the
-	// IPAM provider reported, if any.
+	// Pending describes the claims that are not bound to an address yet: name, pool, creation
+	// time and the reason the IPAM provider reported, if any.
 	Pending []string
 }
 
@@ -236,16 +237,25 @@ func ensureClaim(ctx gocontext.Context, c client.Client, kubevirtMachine *infrav
 	return claim, nil
 }
 
+// pendingReason describes a claim that is not bound to an address yet: its name, the pool it
+// claims from, since when it waits, and the reason the IPAM provider reported, if any. Providers
+// need not report one: the in-cluster provider, for one, leaves the claim status empty while its
+// pool has no free address. The wait is given as a point in time rather than a duration, so that
+// the description, and the condition it ends up in, change only when the claim does.
 func pendingReason(claim *ipamv1.IPAddressClaim) string {
+	description := fmt.Sprintf("%s from %s %s", claim.Name, claim.Spec.PoolRef.Kind, claim.Spec.PoolRef.Name)
+	if !claim.CreationTimestamp.IsZero() {
+		description += ", pending since " + claim.CreationTimestamp.UTC().Format(time.RFC3339)
+	}
 	for _, cond := range claim.Status.Conditions {
 		if cond.Type == ipamv1.IPAddressClaimReadyCondition && cond.Status == metav1.ConditionFalse && cond.Reason != "" {
 			if cond.Message != "" {
-				return fmt.Sprintf("%s (%s: %s)", claim.Name, cond.Reason, cond.Message)
+				return fmt.Sprintf("%s, %s: %s", description, cond.Reason, cond.Message)
 			}
-			return fmt.Sprintf("%s (%s)", claim.Name, cond.Reason)
+			return fmt.Sprintf("%s, %s", description, cond.Reason)
 		}
 	}
-	return claim.Name
+	return description + ", no reason reported by the IPAM provider"
 }
 
 func readAddress(ctx gocontext.Context, c client.Client, claim *ipamv1.IPAddressClaim) (Address, error) {

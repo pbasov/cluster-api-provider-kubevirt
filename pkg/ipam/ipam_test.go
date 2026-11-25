@@ -20,6 +20,7 @@ import (
 	gocontext "context"
 	"net"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -176,7 +177,11 @@ func TestReconcileClaimsCreatesClaimsAndWaits(t *testing.T) {
 	result, err := ReconcileClaims(gocontext.Background(), c, kvm, testCluster)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(result.Interfaces).To(BeNil())
-	g.Expect(result.Pending).To(ConsistOf("test-machine-lan-0", "test-machine-lan-1"))
+	g.Expect(result.Pending).To(ConsistOf(
+		HavePrefix("test-machine-lan-0 from InClusterIPPool test-pool"),
+		HavePrefix("test-machine-lan-1 from InClusterIPPool test-pool"),
+	))
+	g.Expect(result.Pending).To(HaveEach(HaveSuffix(", no reason reported by the IPAM provider")))
 
 	for _, name := range []string{"test-machine-lan-0", "test-machine-lan-1"} {
 		claim := &ipamv1.IPAddressClaim{}
@@ -189,11 +194,19 @@ func TestReconcileClaimsCreatesClaimsAndWaits(t *testing.T) {
 	}
 }
 
+// pendingClaim returns the claim of the lan interface of kvm, created at a fixed time and not
+// bound to an address yet.
+func pendingClaim(kvm *infrav1.KubevirtMachine) *ipamv1.IPAddressClaim {
+	claim := boundClaim(kvm, "test-machine-lan-0")
+	claim.CreationTimestamp = metav1.NewTime(time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC))
+	claim.Status.AddressRef = ipamv1.IPAddressReference{}
+	return claim
+}
+
 func TestReconcileClaimsReportsPoolExhaustion(t *testing.T) {
 	g := NewWithT(t)
 	kvm := newKubevirtMachine("", lanNetwork(1))
-	claim := boundClaim(kvm, "test-machine-lan-0")
-	claim.Status.AddressRef = ipamv1.IPAddressReference{}
+	claim := pendingClaim(kvm)
 	claim.Status.Conditions = []metav1.Condition{{
 		Type:    ipamv1.IPAddressClaimReadyCondition,
 		Status:  metav1.ConditionFalse,
@@ -205,7 +218,22 @@ func TestReconcileClaimsReportsPoolExhaustion(t *testing.T) {
 	result, err := ReconcileClaims(gocontext.Background(), c, kvm, testCluster)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(result.Interfaces).To(BeNil())
-	g.Expect(result.Pending).To(ConsistOf("test-machine-lan-0 (PoolExhausted: pool is full)"))
+	g.Expect(result.Pending).To(ConsistOf(
+		"test-machine-lan-0 from InClusterIPPool test-pool, pending since 2026-11-25T10:00:00Z, PoolExhausted: pool is full"))
+}
+
+// The in-cluster IPAM provider sets no claim condition while its pool is exhausted; the claim, the
+// pool and the time it has waited since are all there is to report.
+func TestReconcileClaimsReportsPendingClaimWithoutReason(t *testing.T) {
+	g := NewWithT(t)
+	kvm := newKubevirtMachine("", lanNetwork(1))
+	c := fake.NewClientBuilder().WithScheme(testScheme(g)).WithObjects(kvm, pendingClaim(kvm)).Build()
+
+	result, err := ReconcileClaims(gocontext.Background(), c, kvm, testCluster)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(result.Interfaces).To(BeNil())
+	g.Expect(result.Pending).To(ConsistOf(
+		"test-machine-lan-0 from InClusterIPPool test-pool, pending since 2026-11-25T10:00:00Z, no reason reported by the IPAM provider"))
 }
 
 func TestReconcileClaimsReadsAddresses(t *testing.T) {

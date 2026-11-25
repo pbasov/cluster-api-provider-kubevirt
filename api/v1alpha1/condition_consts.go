@@ -75,7 +75,9 @@ const (
 	IPAddressClaimedReason = "IPAddressClaimed"
 
 	// WaitingForIPAddressReason (Severity=Info) documents a KubevirtMachine waiting for the IPAM
-	// provider to allocate the addresses it claimed.
+	// provider to allocate the addresses it claimed, also when the pool has no free address: the
+	// contract does not require providers to report that, so the message names each pending claim,
+	// its pool, since when it waits and the provider's reason, if there is one.
 	WaitingForIPAddressReason = "WaitingForIPAddress"
 
 	// IPAddressClaimFailedReason (Severity=Error) documents a KubevirtMachine that could not create

@@ -1087,7 +1087,9 @@ func (r *KubevirtMachineReconciler) deleteKubevirtBootstrapSecret(ctx *context.M
 		return nil
 	}
 
-	if err := infraClusterClient.Delete(ctx, bootstrapDataSecret); err != nil {
+	// Machines sharing the bootstrap data secret share this secret too, and one of them may have
+	// deleted it since the read.
+	if err := infraClusterClient.Delete(ctx, bootstrapDataSecret); err != nil && !apierrors.IsNotFound(err) {
 		return errors.Wrapf(err, "failed to delete kubevirt bootstrap secret for cluster")
 	}
 

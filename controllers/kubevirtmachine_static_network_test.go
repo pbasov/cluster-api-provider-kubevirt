@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
@@ -469,6 +470,27 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		stored.Finalizers = nil
 		Expect(c.Update(gocontext.Background(), stored)).To(Succeed())
 		Expect(c.Delete(gocontext.Background(), stored)).To(Succeed())
+
+		out, err := reconciler.reconcileDelete(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{}))
+	})
+
+	It("does not fail when a machine sharing the bootstrap data secret deleted the userdata secret first", func() {
+		userData := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: bootstrapSecretName + "-userdata", Namespace: kubevirtMachine.Namespace},
+		}
+		external := fake.NewClientBuilder().WithScheme(testing.SetupScheme()).WithObjects(userData).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx gocontext.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if obj.GetName() == userData.Name {
+						// The peer machine won the race between the read and the delete.
+						return apierrors.NewNotFound(corev1.Resource("secrets"), obj.GetName())
+					}
+					return cl.Delete(ctx, obj, opts...)
+				},
+			}).Build()
+		setupWithInfraClient(external)
 
 		out, err := reconciler.reconcileDelete(machineContext)
 		Expect(err).NotTo(HaveOccurred())

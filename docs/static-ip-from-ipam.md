@@ -63,9 +63,12 @@ listed there, CAPK:
    interface, and uses the first claimed address only when the VMI reports none there (a bridged
    interface without the guest agent).
 
-When the `KubevirtMachine` is deleted, the claims it controls are released only after the VM is
-gone, so a replacement machine is never handed an address that is still in use. The claims are
-found by ownership, not from `spec.network`. The network data secret is deleted with the machine.
+When the `KubevirtMachine` is deleted, the claims it controls are released only after both the VM
+and its VMI are gone, so a replacement machine is never handed an address that is still in use.
+KubeVirt removes a VM only after its VMI, and a VMI only after its virt-launcher pods, so by then
+the guest has stopped; the VMI is checked as well for a VM deleted with orphan propagation, which
+leaves the VMI running. The claims are found by ownership, not from `spec.network`. The network
+data secret is deleted with the machine.
 
 The address belongs to the `KubevirtMachine`: it survives VM restarts, stop/start, live migration
 and in-place updates, and is returned to the pool when the machine is deleted. A rollout that
@@ -164,6 +167,16 @@ spec:
   `KubevirtMachineTemplate` spec is immutable as a whole; change it by rolling out a new template.
 - The derived MAC address (`02:00` + IPv4 octets) is locally administered. If KubeMacPool manages
   the namespace, make sure its range does not overlap, or set the MAC in the template.
+- A replacement machine that gets the freed address also gets the same derived MAC address,
+  usually on another node and only seconds after the old guest stopped (with a rollout that
+  deletes first, for example). Networks that track MAC addresses, such as EVPN fabrics with MAC
+  mobility or duplicate address detection, or switches with stale MAC tables, can still tie that
+  MAC to the old port for a while, report it as duplicate, or reflect the guest's own traffic back
+  to it; a guest can then fail IPv6 duplicate address detection and wait minutes for its network.
+  CAPK cannot see that state, and the fabric may need its own settle time after the move. Where it
+  does, prefer rollouts that create the replacement first while the pool has a spare address (the
+  replacement then gets a different address and MAC), or follow the fabric's procedure for
+  clearing a frozen or duplicate MAC address.
 - `clusterctl move` moves the claims with their machines (owner references). Pools are not owned
   by a cluster; label them with `clusterctl.cluster.x-k8s.io/move` to move them along.
 - `<kubevirtmachine>-networkdata` is a reserved secret name in the VM namespace.

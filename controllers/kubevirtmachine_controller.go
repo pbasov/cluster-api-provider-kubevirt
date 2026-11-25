@@ -748,10 +748,18 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 		}
 		if len(claims) > 0 {
-			// Keep the claimed addresses until the VM that uses them is gone, so that a
-			// replacement machine can never be handed an address that is still in use.
+			// Keep the claimed addresses until the guest that uses them is gone, so that a
+			// replacement machine can never be handed an address that is still in use. KubeVirt
+			// removes the VM only after its VMI, and the VMI only after its virt-launcher pods,
+			// so the VM being gone normally means that the guest is gone too. The VMI is checked
+			// as well for a VM deleted without its dependents (orphan propagation), which leaves
+			// the VMI, and with it the guest, running.
 			if externalMachine.Exists() {
 				ctx.Logger.Info("Waiting for the VM to be deleted before releasing its IP addresses...")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			if externalMachine.VMIExists() {
+				ctx.Logger.Info("Waiting for the VMI to be deleted before releasing its IP addresses...")
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 			}
 			ctx.Logger.Info("Releasing IP addresses...")

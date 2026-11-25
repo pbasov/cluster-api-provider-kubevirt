@@ -447,6 +447,31 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
+	It("keeps the address while a VMI outlives its VM, then releases it", func() {
+		// The VM was deleted with orphan propagation: KubeVirt removed it at once and left the
+		// VMI, and with it the guest, running.
+		vmi := &kubevirtv1.VirtualMachineInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: kubevirtMachine.Name, Namespace: kubevirtMachine.Namespace},
+		}
+		setup(append(boundClaimAndAddress(kubevirtMachine, "192.0.2.10"), vmi)...)
+
+		out, err := reconciler.reconcileDelete(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{RequeueAfter: 5 * time.Second}))
+		claim := &ipamv1.IPAddressClaim{}
+		Expect(c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: claimName}, claim)).To(Succeed())
+		Expect(claim.Finalizers).To(ContainElement(ipam.ClaimProtectionFinalizer))
+		Expect(kubevirtMachine.Finalizers).To(ContainElement(infrav1.MachineFinalizer))
+
+		Expect(c.Delete(gocontext.Background(), vmi)).To(Succeed())
+		out, err = reconciler.reconcileDelete(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(out).To(Equal(ctrl.Result{}))
+		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: claimName}, &ipamv1.IPAddressClaim{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		Expect(kubevirtMachine.Finalizers).NotTo(ContainElement(infrav1.MachineFinalizer))
+	})
+
 	It("releases the claims it owns even when spec.network no longer lists them", func() {
 		// A KubevirtMachine whose spec.network was removed before the field became immutable.
 		claims := boundClaimAndAddress(kubevirtMachine, "192.0.2.10")

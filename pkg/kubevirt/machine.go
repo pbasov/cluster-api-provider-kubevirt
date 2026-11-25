@@ -179,6 +179,11 @@ func (m *Machine) Exists() bool {
 	return m.vmInstance != nil
 }
 
+// VMIExists checks if the VM has a VirtualMachineInstance, including one that is being deleted.
+func (m *Machine) VMIExists() bool {
+	return m.vmiInstance != nil
+}
+
 // VMOwnerReference returns an owner reference to the VM, for objects in the VM's namespace that
 // must be garbage collected with it, or nil while the VM does not exist. It does not make the VM
 // the controller of the object.

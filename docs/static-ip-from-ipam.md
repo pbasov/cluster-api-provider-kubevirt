@@ -23,7 +23,9 @@ pool and configure them statically in the guest.
 Without the gate the manager neither watches nor reads any `ipam.cluster.x-k8s.io` resource and
 starts without the IPAM API or RBAC. A `KubevirtMachine` with `spec.network` is then not
 provisioned: `IPAddressClaimed` and `VMProvisioned` are `False` with the reason
-`IPAMFeatureDisabled`, and a Warning event says how to enable the gate.
+`IPAMFeatureDisabled`, and a Warning event says how to enable the gate. The machine is not
+requeued; it is reconciled again when it or its `Machine` changes, and when the manager restarts,
+for example with the gate enabled.
 
 ## How it works
 
@@ -33,9 +35,14 @@ listed there, CAPK:
 1. creates one `IPAddressClaim` per entry of `addressesFromPools`, named
    `<machine>-<interface>-<index>`, controlled by the `KubevirtMachine` and protected by the
    `kubevirtmachine.infrastructure.cluster.x-k8s.io/ip-claim-protection` finalizer;
-2. waits until the IPAM provider binds every claim to an `IPAddress`. Progress is reported in the
-   `IPAddressClaimed` condition, which is part of the `Ready` summary, including the
-   `PoolExhausted` reason when the pool is full. The VM is not created before that;
+2. waits until the IPAM provider binds every claim to an `IPAddress`. The VM is not created before
+   that. Progress is reported in the `IPAddressClaimed` condition, which is part of the `Ready`
+   summary: while claims are pending its reason is `WaitingForIPAddress`, and the message names
+   each pending claim, its pool, the time it was created, and the reason the IPAM provider set on
+   the claim, if any. The contract does not require providers to report an exhausted pool, and
+   the in-cluster provider sets no claim condition in that case (it only logs it), so a claim
+   that stays pending usually means that the pool has no free address. `VMProvisioned` is `False`
+   with the same reason meanwhile;
 3. pins a MAC address on the interface, unless the template already sets one. The MAC address is
    derived from the first address of the interface (`02:00` followed by the four octets), so it
    stays the same as long as the address does;
@@ -46,8 +53,10 @@ listed there, CAPK:
    cluster, under the key `networkdata`, and referenced from the cloud-init volume. Each machine
    has its own secret, also when machines share a bootstrap data secret; the
    `<bootstrap secret>-userdata` secret holds only the user data. (`spec.cloudInit.networkData`
-   and `networkDataSecretRef` are delivered through the same per-machine secret.) cloud-init
-   applies it before the network comes up, so the guest never runs DHCP on the interface;
+   and `networkDataSecretRef` are delivered through the same per-machine secret.) Once the VM
+   exists, it owns the secret, so the secret is garbage collected with VMs deleted without CAPK.
+   cloud-init applies it before the network comes up, so the guest never runs DHCP on the
+   interface;
 5. reports the claimed addresses in `status.addresses`, without relying on the qemu guest agent.
    They come first, followed by the addresses the VMI reports (IPv4 and IPv6), without
    duplicates. The SSH bootstrap check keeps using the address the VMI reports on its first
@@ -138,9 +147,9 @@ spec:
 
 - Only IPv4 is supported for now: one IPv4 address per interface, from one pool
   (`addressesFromPools` accepts one entry), and up to three IPv4 nameservers. An IPv6 address
-  allocated by a pool stops the machine: `IPAddressClaimed` is `False` with the reason
-  `IPAddressInvalid` and a Warning event is emitted; the machine is not requeued. The API is
-  shaped for dual stack: `addressesFromPools` stays a list, so a second (IPv6) pool can be
+  allocated by a pool stops the machine: `IPAddressClaimed` and `VMProvisioned` are `False` with
+  the reason `IPAddressInvalid` and a Warning event is emitted; the machine is not requeued. The
+  API is shaped for dual stack: `addressesFromPools` stays a list, so a second (IPv6) pool can be
   allowed later by relaxing the limit, and the nameserver validation can be relaxed to IP
   addresses.
 - The rendered network data is the guest's whole network configuration. Interfaces of the

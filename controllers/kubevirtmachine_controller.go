@@ -203,7 +203,7 @@ func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.
 
 	// Handle non-deleted machines
 	res, err := r.reconcileNormal(machineContext)
-	if err == nil && res.IsZero() {
+	if err == nil && res.IsZero() && !staticNetworkRefused(kubevirtMachine) {
 		// Update the providerID on the Node
 		// The ProviderID on the Node and the providerID on  the KubevirtMachine are used to set the NodeRef
 		// This code is needed here as long as there is no Kubevirt cloud provider setting the providerID in the node
@@ -515,12 +515,7 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 		if ipam.IsInvalidAddress(err) {
 			reason = infrav1.IPAddressInvalidReason
 		}
-		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
-			Type:    infrav1.IPAddressClaimedCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  reason,
-			Message: err.Error(),
-		})
+		changed := setIPAddressClaimed(ctx.KubevirtMachine, reason, err.Error())
 		if reason == infrav1.IPAddressInvalidReason {
 			setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, reason, "Not provisioned: the IP addresses of spec.network cannot be used")
 		} else {
@@ -532,7 +527,9 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 			// change to the machine, which the KubevirtMachine watch picks up. Returning an error
 			// would only retry with backoff and feed the error metrics.
 			ctx.Logger.Info("Not provisioning the machine: unusable IP address or spec.network", "reason", err.Error())
-			r.warningEvent(ctx.KubevirtMachine, infrav1.IPAddressInvalidReason, "ClaimIPAddresses", err.Error())
+			if changed {
+				r.warningEvent(ctx.KubevirtMachine, infrav1.IPAddressInvalidReason, "ClaimIPAddresses", err.Error())
+			}
 			return nil, ctrl.Result{}, nil
 		}
 		return nil, ctrl.Result{}, err
@@ -583,26 +580,50 @@ func setVMNotProvisionedForStaticNetwork(kubevirtMachine *infrav1.KubevirtMachin
 	})
 }
 
-// reconcileIPAMDisabled reports a KubevirtMachine with spec.network that cannot be provisioned
-// because the KubevirtIPAM feature gate is disabled. Nothing changes until the manager is restarted
-// with the gate, which reconciles every machine again, so the machine is not requeued.
-func (r *KubevirtMachineReconciler) reconcileIPAMDisabled(ctx *context.MachineContext) (ctrl.Result, error) {
-	const message = "spec.network is set, but the KubevirtIPAM feature gate of the KubeVirt infrastructure provider is disabled; " +
-		"enable it with --feature-gates=KubevirtIPAM=true, or remove spec.network"
-	ctx.Logger.Info("Not provisioning the machine: " + message)
-	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+// setIPAddressClaimed sets IPAddressClaimed to False with the reason and message, and reports
+// whether that changed the condition, so that a Warning event is emitted once per problem rather
+// than on every reconcile.
+func setIPAddressClaimed(kubevirtMachine *infrav1.KubevirtMachine, reason, message string) bool {
+	previous := conditions.Get(kubevirtMachine, infrav1.IPAddressClaimedCondition)
+	changed := previous == nil || previous.Status != metav1.ConditionFalse || previous.Reason != reason || previous.Message != message
+	conditions.Set(kubevirtMachine, metav1.Condition{
 		Type:    infrav1.IPAddressClaimedCondition,
 		Status:  metav1.ConditionFalse,
-		Reason:  infrav1.IPAMFeatureDisabledReason,
+		Reason:  reason,
 		Message: message,
 	})
+	return changed
+}
+
+// staticNetworkRefused reports whether reconcileNormal stopped for good on spec.network: the
+// KubevirtIPAM feature gate is disabled, or an address or spec.network cannot be used. Such a
+// machine is not requeued: without a VM there is no Node whose providerID to update, and polling
+// for it would only retry every few seconds for nothing. It is reconciled again on any change to
+// it, its Machine or its claims, and when the manager restarts, for example with the gate enabled.
+func staticNetworkRefused(kubevirtMachine *infrav1.KubevirtMachine) bool {
+	cond := conditions.Get(kubevirtMachine, infrav1.IPAddressClaimedCondition)
+	return cond != nil && cond.Status == metav1.ConditionFalse &&
+		(cond.Reason == infrav1.IPAMFeatureDisabledReason || cond.Reason == infrav1.IPAddressInvalidReason)
+}
+
+// reconcileIPAMDisabled reports a KubevirtMachine with spec.network that cannot be provisioned
+// because the KubevirtIPAM feature gate is disabled. Nothing changes until the manager is restarted
+// with the gate, which reconciles every machine again, so the machine is not requeued (see
+// staticNetworkRefused).
+func (r *KubevirtMachineReconciler) reconcileIPAMDisabled(ctx *context.MachineContext) (ctrl.Result, error) {
+	const message = "spec.network is set, but the KubevirtIPAM feature gate of the KubeVirt infrastructure provider is disabled; " +
+		"enable it with --feature-gates=KubevirtIPAM=true, or replace the machine with one from a template without spec.network"
+	ctx.Logger.Info("Not provisioning the machine: " + message)
+	changed := setIPAddressClaimed(ctx.KubevirtMachine, infrav1.IPAMFeatureDisabledReason, message)
 	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
 		Type:    infrav1.VMProvisionedCondition,
 		Status:  metav1.ConditionFalse,
 		Reason:  infrav1.IPAMFeatureDisabledReason,
 		Message: message,
 	})
-	r.warningEvent(ctx.KubevirtMachine, infrav1.IPAMFeatureDisabledReason, "ClaimIPAddresses", message)
+	if changed {
+		r.warningEvent(ctx.KubevirtMachine, infrav1.IPAMFeatureDisabledReason, "ClaimIPAddresses", message)
+	}
 	return ctrl.Result{}, nil
 }
 

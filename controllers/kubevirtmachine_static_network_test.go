@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
@@ -476,5 +477,52 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		claims := &ipamv1.IPAddressClaimList{}
 		Expect(c.List(gocontext.Background(), claims)).To(Succeed())
 		Expect(claims.Items).To(BeEmpty())
+	})
+
+	Context("when spec.network keeps the machine from being provisioned for good", func() {
+		BeforeEach(func() {
+			controllerutil.AddFinalizer(kubevirtMachine, infrav1.MachineFinalizer)
+			conditions.Set(cluster, metav1.Condition{
+				Type:   string(clusterv1.InfrastructureReadyCondition),
+				Status: metav1.ConditionTrue,
+				Reason: "Ready",
+			})
+		})
+
+		// reconcileTwice runs Reconcile twice and expects neither run to requeue. The workload
+		// cluster mock expects no call, so looking for the Node to set its providerID on fails the
+		// test.
+		reconcileTwice := func() *infrav1.KubevirtMachine {
+			request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(kubevirtMachine)}
+			for range 2 {
+				out, err := reconciler.Reconcile(machineContext, request)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(out).To(Equal(ctrl.Result{}), "terminal, not requeued")
+			}
+			stored := &infrav1.KubevirtMachine{}
+			Expect(c.Get(gocontext.Background(), request.NamespacedName, stored)).To(Succeed())
+			return stored
+		}
+
+		It("neither requeues nor polls the workload cluster while the feature gate is disabled", func() {
+			setup()
+			reconciler.IPAMEnabled = false
+
+			stored := reconcileTwice()
+			cond := conditions.Get(stored, infrav1.IPAddressClaimedCondition)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(infrav1.IPAMFeatureDisabledReason))
+			Expect(recorder.Events).To(HaveLen(1), "one Warning event, not one per reconcile")
+		})
+
+		It("neither requeues nor polls the workload cluster when an address cannot be used", func() {
+			setup(boundClaimAndAddress(kubevirtMachine, "2001:db8::10")...)
+
+			stored := reconcileTwice()
+			cond := conditions.Get(stored, infrav1.IPAddressClaimedCondition)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(infrav1.IPAddressInvalidReason))
+			Expect(recorder.Events).To(HaveLen(1), "one Warning event, not one per reconcile")
+		})
 	})
 })

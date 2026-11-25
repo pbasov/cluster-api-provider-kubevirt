@@ -224,6 +224,13 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 	})
 
 	It("claims an address and does not create the VM until it is allocated", func() {
+		// Left over from an earlier reconcile, before the bootstrap data was there.
+		conditions.Set(kubevirtMachine, metav1.Condition{
+			Type:    infrav1.VMProvisionedCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  infrav1.WaitingForBootstrapDataReason,
+			Message: "Waiting for bootstrap data to become available",
+		})
 		setup()
 
 		out, err := reconciler.reconcileNormal(machineContext)
@@ -245,6 +252,28 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(cond.Message).To(ContainSubstring(claimName + " from InClusterIPPool pool"))
 		Expect(cond.Message).To(ContainSubstring("no reason reported by the IPAM provider"))
 		Expect(cond.Message).To(ContainSubstring("check that the pool has a free address"))
+
+		// VMProvisioned tells what the VM is really waiting for.
+		vmCond := conditions.Get(kubevirtMachine, infrav1.VMProvisionedCondition)
+		Expect(vmCond).NotTo(BeNil())
+		Expect(vmCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(vmCond.Reason).To(Equal(infrav1.WaitingForIPAddressReason))
+		Expect(vmCond.Message).To(Equal("Waiting for the IP addresses of spec.network to be allocated"))
+	})
+
+	It("leaves VMProvisioned of an existing VM alone while an address is pending", func() {
+		conditions.Set(kubevirtMachine, metav1.Condition{
+			Type:    infrav1.VMProvisionedCondition,
+			Status:  metav1.ConditionTrue,
+			Reason:  "VMProvisioned",
+			Message: "Virtual machine is provisioned and running",
+		})
+		setup()
+
+		_, err := reconciler.reconcileNormal(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(conditions.IsFalse(kubevirtMachine, infrav1.IPAddressClaimedCondition)).To(BeTrue())
+		Expect(conditions.IsTrue(kubevirtMachine, infrav1.VMProvisionedCondition)).To(BeTrue())
 	})
 
 	It("creates the VM with a static network configuration once the address is allocated", func() {
@@ -404,6 +433,10 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 		Expect(cond.Reason).To(Equal(infrav1.IPAddressInvalidReason))
 		Expect(cond.Message).To(ContainSubstring("only IPv4 pools are supported for now"))
+		vmCond := conditions.Get(kubevirtMachine, infrav1.VMProvisionedCondition)
+		Expect(vmCond).NotTo(BeNil())
+		Expect(vmCond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(vmCond.Reason).To(Equal(infrav1.IPAddressInvalidReason))
 		Expect(recorder.Events).To(Receive(And(ContainSubstring("Warning"), ContainSubstring(infrav1.IPAddressInvalidReason))))
 
 		err = c.Get(gocontext.Background(), client.ObjectKey{Namespace: kubevirtMachine.Namespace, Name: kubevirtMachine.Name}, &kubevirtv1.VirtualMachine{})

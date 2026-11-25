@@ -521,6 +521,11 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 			Reason:  reason,
 			Message: err.Error(),
 		})
+		if reason == infrav1.IPAddressInvalidReason {
+			setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, reason, "Not provisioned: the IP addresses of spec.network cannot be used")
+		} else {
+			setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, reason, "Waiting for the IP addresses of spec.network: claiming them failed")
+		}
 		if ipam.IsInvalidAddress(err) {
 			// Terminal: retrying cannot help. An allocated IPv6 address, or one without a usable
 			// prefix, stays what it is for as long as its claim exists, and the other causes need a
@@ -542,6 +547,7 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 			Message: "Waiting for IPAddressClaims: " + strings.Join(result.Pending, "; ") +
 				". If this persists, check that the pool has a free address and that its IPAM provider is running",
 		})
+		setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, infrav1.WaitingForIPAddressReason, "Waiting for the IP addresses of spec.network to be allocated")
 		// The IPAddressClaim watch requeues as soon as an address is bound.
 		return nil, ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -559,6 +565,22 @@ func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineC
 	})
 	ctx.StaticNetwork = result.Interfaces
 	return networkData, ctrl.Result{}, nil
+}
+
+// setVMNotProvisionedForStaticNetwork reports in VMProvisioned that the VM is not provisioned
+// because the addresses of spec.network are not there yet, or cannot be used, rather than leaving
+// an earlier wait in it, such as the one for bootstrap data. The details are in IPAddressClaimed. A
+// VM reported as provisioned already stays so: it exists, only its reconciliation is held back.
+func setVMNotProvisionedForStaticNetwork(kubevirtMachine *infrav1.KubevirtMachine, reason, message string) {
+	if conditions.IsTrue(kubevirtMachine, infrav1.VMProvisionedCondition) {
+		return
+	}
+	conditions.Set(kubevirtMachine, metav1.Condition{
+		Type:    infrav1.VMProvisionedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	})
 }
 
 // reconcileIPAMDisabled reports a KubevirtMachine with spec.network that cannot be provisioned

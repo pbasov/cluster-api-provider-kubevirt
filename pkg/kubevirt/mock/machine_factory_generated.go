@@ -10,6 +10,7 @@ import (
 	time "time"
 
 	gomock "github.com/golang/mock/gomock"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	client "sigs.k8s.io/controller-runtime/pkg/client"
 
 	context0 "sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
@@ -143,7 +144,17 @@ func (mr *MockMachineInterfaceMockRecorder) GenerateProviderID() *gomock.Call {
 
 // GetVMNotReadyReason mocks base method.
 func (m *MockMachineInterface) GetVMNotReadyReason() (string, string) {
-	return "", ""
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetVMNotReadyReason")
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(string)
+	return ret0, ret1
+}
+
+// GetVMNotReadyReason indicates an expected call of GetVMNotReadyReason.
+func (mr *MockMachineInterfaceMockRecorder) GetVMNotReadyReason() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetVMNotReadyReason", reflect.TypeOf((*MockMachineInterface)(nil).GetVMNotReadyReason))
 }
 
 // IsBootstrapped mocks base method.
@@ -219,6 +230,20 @@ func (m *MockMachineInterface) SupportsCheckingIsBootstrapped() bool {
 func (mr *MockMachineInterfaceMockRecorder) SupportsCheckingIsBootstrapped() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SupportsCheckingIsBootstrapped", reflect.TypeOf((*MockMachineInterface)(nil).SupportsCheckingIsBootstrapped))
+}
+
+// VMOwnerReference mocks base method.
+func (m *MockMachineInterface) VMOwnerReference() *v1.OwnerReference {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "VMOwnerReference")
+	ret0, _ := ret[0].(*v1.OwnerReference)
+	return ret0
+}
+
+// VMOwnerReference indicates an expected call of VMOwnerReference.
+func (mr *MockMachineInterfaceMockRecorder) VMOwnerReference() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "VMOwnerReference", reflect.TypeOf((*MockMachineInterface)(nil).VMOwnerReference))
 }
 
 // MockMachineFactory is a mock of MachineFactory interface.

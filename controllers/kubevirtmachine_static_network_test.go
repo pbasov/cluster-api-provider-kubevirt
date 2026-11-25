@@ -479,6 +479,45 @@ var _ = Describe("reconcile a kubevirt machine with spec.network", func() {
 		Expect(claims.Items).To(BeEmpty())
 	})
 
+	It("makes the existing VM the owner of the network data secret in the infra cluster", func() {
+		external := fake.NewClientBuilder().WithScheme(testing.SetupScheme()).WithObjects(&kubevirtv1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{Name: kubevirtMachine.Name, Namespace: kubevirtMachine.Namespace, UID: "vm-uid"},
+		}).Build()
+		setupWithInfraClient(external, boundClaimAndAddress(kubevirtMachine, "192.0.2.10")...)
+
+		_, err := reconciler.reconcileNormal(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(getSecret(external, kubevirtMachine.Name+"-networkdata").OwnerReferences).To(Equal([]metav1.OwnerReference{{
+			APIVersion: "kubevirt.io/v1",
+			Kind:       "VirtualMachine",
+			Name:       kubevirtMachine.Name,
+			UID:        "vm-uid",
+		}}))
+	})
+
+	It("drops the owner reference to a VM that is gone before creating the VM again", func() {
+		otherOwner := metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "keep", UID: "keep-uid"}
+		networkDataSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      kubevirtMachine.Name + "-networkdata",
+				Namespace: kubevirtMachine.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					{APIVersion: "kubevirt.io/v1", Kind: "VirtualMachine", Name: kubevirtMachine.Name, UID: "deleted-vm-uid"},
+					otherOwner,
+				},
+			},
+			Data: map[string][]byte{"networkdata": []byte("{}")},
+		}
+		setup(append(boundClaimAndAddress(kubevirtMachine, "192.0.2.10"), networkDataSecret)...)
+
+		_, err := reconciler.reconcileNormal(machineContext)
+		Expect(err).NotTo(HaveOccurred())
+
+		getVM(c, kubevirtMachine)
+		Expect(getSecret(c, networkDataSecret.Name).OwnerReferences).To(Equal([]metav1.OwnerReference{otherOwner}))
+	})
+
 	Context("when spec.network keeps the machine from being provisioned for good", func() {
 		BeforeEach(func() {
 			controllerutil.AddFinalizer(kubevirtMachine, infrav1.MachineFinalizer)

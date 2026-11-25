@@ -29,9 +29,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/events"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	capierrors "sigs.k8s.io/cluster-api/errors" //nolint:staticcheck // deprecated but no replacement yet
@@ -300,7 +302,13 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to fetch kubevirt bootstrap secret")
 	}
 
-	if err := r.reconcileKubevirtNetworkDataSecret(ctx, infraClusterClient, vmNamespace, staticNetworkData); err != nil {
+	// Create a helper for managing the KubeVirt VM hosting the machine.
+	externalMachine, err := r.MachineFactory.NewMachine(ctx, infraClusterClient, r.Client, vmNamespace, clusterNodeSshKeys)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to create helper for managing the externalMachine")
+	}
+
+	if err := r.reconcileKubevirtNetworkDataSecret(ctx, infraClusterClient, vmNamespace, staticNetworkData, externalMachine); err != nil {
 		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
 			Type:    infrav1.VMProvisionedCondition,
 			Status:  metav1.ConditionFalse,
@@ -308,12 +316,6 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 			Message: err.Error(),
 		})
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to prepare cloud-init network data")
-	}
-
-	// Create a helper for managing the KubeVirt VM hosting the machine.
-	externalMachine, err := r.MachineFactory.NewMachine(ctx, infraClusterClient, r.Client, vmNamespace, clusterNodeSshKeys)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "failed to create helper for managing the externalMachine")
 	}
 
 	isTerminal, terminalReason, err := externalMachine.IsTerminal()
@@ -948,7 +950,14 @@ func (r *KubevirtMachineReconciler) reconcileKubevirtBootstrapSecret(ctx *contex
 // The network data is not written to the "<bootstrap data secret>-userdata" secret: machines can
 // share a bootstrap data secret, for example all the machines of a MachineDeployment with some
 // bootstrap providers, and with it that copy, while each of them needs its own network data.
-func (r *KubevirtMachineReconciler) reconcileKubevirtNetworkDataSecret(ctx *context.MachineContext, infraClusterClient client.Client, vmNamespace string, staticNetworkData []byte) error {
+//
+// The secret is owned by the VM, once the VM exists, so that it is garbage collected with the VM
+// when the VM goes without CAPK, for example when the VMs of a cluster are deleted in the infra
+// cluster directly. The KubevirtMachine cannot be its owner: owner references do not cross
+// namespaces or clusters, and the secret lives next to the VM, which can be in another namespace
+// or, with an external infra cluster, in another cluster. The deletion of the KubevirtMachine
+// still deletes the secret explicitly.
+func (r *KubevirtMachineReconciler) reconcileKubevirtNetworkDataSecret(ctx *context.MachineContext, infraClusterClient client.Client, vmNamespace string, staticNetworkData []byte, vm kubevirt.MachineInterface) error {
 	networkData := staticNetworkData
 	if networkData == nil {
 		var err error
@@ -971,6 +980,7 @@ func (r *KubevirtMachineReconciler) reconcileKubevirtNetworkDataSecret(ctx *cont
 			networkDataSecret.Labels = map[string]string{}
 		}
 		networkDataSecret.Labels[clusterv1.ClusterNameLabel] = ctx.Cluster.Name
+		networkDataSecret.OwnerReferences = withVMOwner(networkDataSecret.OwnerReferences, vm.VMOwnerReference())
 		networkDataSecret.Type = clusterv1.ClusterSecretType
 		networkDataSecret.Data = map[string][]byte{
 			"networkdata": networkData,
@@ -990,6 +1000,25 @@ func (r *KubevirtMachineReconciler) reconcileKubevirtNetworkDataSecret(ctx *cont
 	}
 
 	return nil
+}
+
+// withVMOwner returns the owner references with owner as the only VirtualMachine among them, or with
+// none when owner is nil. The reference to a VM that is gone, and that this machine is about to
+// create again, is dropped, so that the garbage collector does not delete the secret the new VM
+// needs.
+func withVMOwner(refs []metav1.OwnerReference, owner *metav1.OwnerReference) []metav1.OwnerReference {
+	var result []metav1.OwnerReference
+	for _, ref := range refs {
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err == nil && gv.Group == kubevirtv1.VirtualMachineGroupVersionKind.Group && ref.Kind == kubevirtv1.VirtualMachineGroupVersionKind.Kind {
+			continue
+		}
+		result = append(result, ref)
+	}
+	if owner != nil {
+		result = append(result, *owner)
+	}
+	return result
 }
 
 // getNetworkData returns the cloud-init network data of spec.cloudInit: the inline networkData, or

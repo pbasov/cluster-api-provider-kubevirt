@@ -179,6 +179,21 @@ func (m *Machine) Exists() bool {
 	return m.vmInstance != nil
 }
 
+// VMOwnerReference returns an owner reference to the VM, for objects in the VM's namespace that
+// must be garbage collected with it, or nil while the VM does not exist. It does not make the VM
+// the controller of the object.
+func (m *Machine) VMOwnerReference() *metav1.OwnerReference {
+	if m.vmInstance == nil || m.vmInstance.UID == "" {
+		return nil
+	}
+	return &metav1.OwnerReference{
+		APIVersion: kubevirtv1.VirtualMachineGroupVersionKind.GroupVersion().String(),
+		Kind:       kubevirtv1.VirtualMachineGroupVersionKind.Kind,
+		Name:       m.vmInstance.Name,
+		UID:        m.vmInstance.UID,
+	}
+}
+
 // Create creates a new VM for this machine.
 func (m *Machine) Create(ctx gocontext.Context) error {
 	m.machineContext.Logger.Info(fmt.Sprintf("Creating VM with role '%s'...", nodeRole(m.machineContext)))

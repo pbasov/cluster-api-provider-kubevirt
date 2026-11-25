@@ -663,6 +663,7 @@ var _ = Describe("reconcile a kubevirt machine", func() {
 		machineMock.EXPECT().IsTerminal().Return(false, "", nil).Times(1)
 		machineMock.EXPECT().Exists().Return(true).Times(1)
 		machineMock.EXPECT().IsReady().Return(false).AnyTimes()
+		machineMock.EXPECT().GetVMNotReadyReason().Return("VMNotReady", "VM is not ready").AnyTimes()
 		machineMock.EXPECT().Address().Return("1.1.1.1").AnyTimes()
 		machineMock.EXPECT().SupportsCheckingIsBootstrapped().Return(false).AnyTimes()
 		machineMock.EXPECT().GenerateProviderID().Return("abc", nil).AnyTimes()

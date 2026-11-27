@@ -40,6 +40,7 @@ type VirtualMachineTemplateSpec struct {
 }
 
 // KubevirtMachineSpec defines the desired state of KubevirtMachine.
+// +kubebuilder:validation:XValidation:rule="!has(self.network) || !has(self.cloudInit) || (!has(self.cloudInit.networkData) && !has(self.cloudInit.networkDataSecretRef))",message="network cannot be combined with cloudInit.networkData or cloudInit.networkDataSecretRef"
 type KubevirtMachineSpec struct {
 	VirtualMachineTemplate VirtualMachineTemplateSpec `json:"virtualMachineTemplate,omitempty"`
 
@@ -62,6 +63,29 @@ type KubevirtMachineSpec struct {
 	// are immutable on KubevirtMachine after creation.
 	// +optional
 	CloudInit *CloudInitSpec `json:"cloudInit,omitempty"`
+
+	// Network configures static addressing of the virtual machine's interfaces from
+	// Cluster API IPAM pools. It requires the KubevirtIPAM feature gate of the provider;
+	// with the gate disabled a KubevirtMachine with network is not provisioned.
+	// For every interface listed here the controller creates one IPAddressClaim per pool,
+	// waits for the resulting IPAddress, pins a MAC address derived from that address on
+	// the interface (unless the template sets one) and renders a static network
+	// configuration for the guest, in the format of the cloud-init data source selected by
+	// spec.cloudInit.dataSource (config drive by default), so the guest needs no DHCP. The
+	// configuration is stored in the Secret "<KubevirtMachine name>-networkdata" next to the
+	// virtual machine in the infra cluster. The claimed addresses are also reported in
+	// status.addresses, without relying on the guest agent. The claims are released when the
+	// KubevirtMachine is deleted, once its virtual machine is gone.
+	// Only IPv4 is supported for now: one IPv4 address per interface. An IPv6 address
+	// allocated by a pool is reported on the IPAddressClaimed condition with the
+	// IPAddressInvalid reason, and the machine is not provisioned.
+	// It cannot be combined with spec.cloudInit.networkData or networkDataSecretRef.
+	// Network data is applied during the VM's first boot, so this field's presence and value
+	// are immutable on KubevirtMachine after creation.
+	// When unset, interfaces are configured the way the guest and the virtual machine
+	// template decide.
+	// +optional
+	Network *NetworkSpec `json:"network,omitempty"`
 }
 
 // CloudInitDataSource describes the type of cloud-init data source attached to the virtual machine.
@@ -140,6 +164,74 @@ func (c *CloudInitSpec) GetNetworkData() *string {
 	}
 
 	return c.NetworkData
+}
+
+// NetworkSpec defines static guest networking for a KubevirtMachine.
+//
+// Only IPv4 is supported for now: one IPv4 address per interface, from one pool, with IPv4
+// nameservers. An IPv6 address allocated by a pool is reported with the IPAddressInvalid reason
+// and the machine is not provisioned. The API is shaped for dual stack without a breaking
+// change: addressesFromPools is a list, limited to one entry for now, and the validation of
+// nameservers can be relaxed from IPv4 to IP addresses.
+type NetworkSpec struct {
+	// Interfaces lists the interfaces of the virtual machine template that get their
+	// addresses from IPAM pools.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=name
+	Interfaces []NetworkInterfaceSpec `json:"interfaces"`
+}
+
+// NetworkInterfaceSpec defines the addressing of one interface of the virtual machine.
+type NetworkInterfaceSpec struct {
+	// Name is the name of the interface in
+	// spec.virtualMachineTemplate.spec.template.spec.domain.devices.interfaces.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// AddressesFromPools references the IPAM pools to claim addresses from, one address
+	// per pool. The first claimed address that has a gateway provides the default route.
+	// Only one IPv4 pool is supported for now. The field is a list so that a second pool,
+	// for an IPv6 address, can be allowed later without an API change.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=1
+	AddressesFromPools []IPPoolReference `json:"addressesFromPools"`
+
+	// Nameservers is a list of IPv4 addresses of DNS servers configured in the guest.
+	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:Format=ipv4
+	Nameservers []string `json:"nameservers,omitempty"`
+
+	// MTU is the MTU configured on the interface in the guest.
+	// +optional
+	// +kubebuilder:validation:Minimum=68
+	// +kubebuilder:validation:Maximum=65535
+	MTU *int32 `json:"mtu,omitempty"`
+}
+
+// IPPoolReference references a pool of the Cluster API IPAM contract, in the namespace of the
+// KubevirtMachine. Every field is required, as in the poolRef of an IPAddressClaim, which is
+// created from it.
+type IPPoolReference struct {
+	// APIGroup is the API group of the pool, for example ipam.cluster.x-k8s.io.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	APIGroup string `json:"apiGroup"`
+
+	// Kind is the kind of the pool, for example InClusterIPPool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Kind string `json:"kind"`
+
+	// Name is the name of the pool.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	Name string `json:"name"`
 }
 
 // VirtualMachineBootstrapCheckSpec defines how the controller will remotely check CAPI Sentinel file content.
@@ -235,6 +327,8 @@ type KubevirtMachineStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready",description="Is machine ready"
 // +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.cloudInit)) == (has(oldSelf.spec) && has(oldSelf.spec.cloudInit))",message="CloudInit presence is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.cloudInit) || !has(oldSelf.spec) || !has(oldSelf.spec.cloudInit) || self.spec.cloudInit == oldSelf.spec.cloudInit",message="CloudInit is immutable"
+// +kubebuilder:validation:XValidation:rule="(has(self.spec) && has(self.spec.network)) == (has(oldSelf.spec) && has(oldSelf.spec.network))",message="Network presence is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.network) || !has(oldSelf.spec) || !has(oldSelf.spec.network) || self.spec.network == oldSelf.spec.network",message="Network is immutable"
 
 // KubevirtMachine is the Schema for the kubevirtmachines API.
 type KubevirtMachine struct {

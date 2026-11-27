@@ -75,6 +75,9 @@ func (wh *kubevirtMachineTemplateHandler) Handle(_ context.Context, req admissio
 		if err := wh.decoder.Decode(req, kvTmplt); err != nil {
 			return admission.Errored(http.StatusBadRequest, err)
 		}
+		if !wh.excludedAnnotations.Excludes(kvTmplt) {
+			err = validateNetworkInterfaces(&kvTmplt.Spec.Template.Spec)
+		}
 
 	case admissionv1.Update:
 		oldKVTmplt := &v1alpha1.KubevirtMachineTemplate{}

@@ -73,6 +73,15 @@ var _ = Describe("Template Validation - ensure immutability in update request", 
 					},
 				},
 			}, errors.New(immutableWarning)),
+			Entry("should return error if spec.network is added", &v1alpha1.KubevirtMachineTemplate{
+				Spec: v1alpha1.KubevirtMachineTemplateSpec{
+					Template: v1alpha1.KubevirtMachineTemplateResource{
+						Spec: v1alpha1.KubevirtMachineSpec{Network: &v1alpha1.NetworkSpec{
+							Interfaces: []v1alpha1.NetworkInterfaceSpec{{Name: "lan"}},
+						}},
+					},
+				},
+			}, errors.New(immutableWarning)),
 		)
 	})
 

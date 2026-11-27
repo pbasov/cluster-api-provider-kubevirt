@@ -179,6 +179,26 @@ func (m *Machine) Exists() bool {
 	return m.vmInstance != nil
 }
 
+// VMIExists checks if the VM has a VirtualMachineInstance, including one that is being deleted.
+func (m *Machine) VMIExists() bool {
+	return m.vmiInstance != nil
+}
+
+// VMOwnerReference returns an owner reference to the VM, for objects in the VM's namespace that
+// must be garbage collected with it, or nil while the VM does not exist. It does not make the VM
+// the controller of the object.
+func (m *Machine) VMOwnerReference() *metav1.OwnerReference {
+	if m.vmInstance == nil || m.vmInstance.UID == "" {
+		return nil
+	}
+	return &metav1.OwnerReference{
+		APIVersion: kubevirtv1.VirtualMachineGroupVersionKind.GroupVersion().String(),
+		Kind:       kubevirtv1.VirtualMachineGroupVersionKind.Kind,
+		Name:       m.vmInstance.Name,
+		UID:        m.vmInstance.UID,
+	}
+}
+
 // Create creates a new VM for this machine.
 func (m *Machine) Create(ctx gocontext.Context) error {
 	m.machineContext.Logger.Info(fmt.Sprintf("Creating VM with role '%s'...", nodeRole(m.machineContext)))
@@ -228,25 +248,59 @@ func (m *Machine) hasReadyCondition() bool {
 	return false
 }
 
-// Address returns the IP address of the VM.
+// Address returns the IP address the controller uses to reach the VM, in particular for the SSH
+// bootstrap check. It is the address the VMI reports on its first interface, as without
+// spec.network: that keeps the check on the network the management cluster reached before, such
+// as the pod network, rather than moving it to a secondary network it may not route to. Only when
+// the VMI reports no address there, as for a bridged interface without the guest agent, is it the
+// first address claimed for spec.network, then the only address known for the VM.
 func (m *Machine) Address() string {
-	if m.vmiInstance != nil && len(m.vmiInstance.Status.Interfaces) > 0 {
+	if m.vmiInstance != nil && len(m.vmiInstance.Status.Interfaces) > 0 && m.vmiInstance.Status.Interfaces[0].IP != "" {
 		return m.vmiInstance.Status.Interfaces[0].IP
+	}
+
+	if addresses := m.staticAddresses(); len(addresses) > 0 {
+		return addresses[0]
 	}
 
 	return ""
 }
 
-// Addresses returns all IP addresses of the VM (for dual-stack support).
-// It collects IPs from all network interfaces, supporting both IPv4 and IPv6.
+// Addresses returns all IP addresses of the VM, without duplicates: first the addresses claimed
+// for spec.network, in interface and pool order, which are known from the start and do not depend
+// on the guest agent, then the addresses the VMI reports on its interfaces, IPv4 and IPv6, in
+// interface order.
 func (m *Machine) Addresses() []string {
+	addresses := m.staticAddresses()
 	if m.vmiInstance == nil {
-		return nil
+		return addresses
 	}
 
-	var addresses []string
+	seen := make(map[string]bool, len(addresses))
+	for _, address := range addresses {
+		seen[address] = true
+	}
 	for _, iface := range m.vmiInstance.Status.Interfaces {
-		addresses = append(addresses, iface.IPs...)
+		for _, address := range iface.IPs {
+			if !seen[address] {
+				seen[address] = true
+				addresses = append(addresses, address)
+			}
+		}
+	}
+	return addresses
+}
+
+// staticAddresses returns the addresses claimed for spec.network, in interface and pool order.
+func (m *Machine) staticAddresses() []string {
+	if m.machineContext == nil {
+		return nil
+	}
+	var addresses []string
+	for _, iface := range m.machineContext.StaticNetwork {
+		for _, addr := range iface.Addresses {
+			addresses = append(addresses, addr.IP.String())
+		}
 	}
 	return addresses
 }
@@ -425,6 +479,12 @@ func (m *Machine) Delete() error {
 	}
 
 	if err := m.infraClient.Delete(gocontext.Background(), vm); err != nil {
+		// The VM can be gone already although Get found it: the client may read from a cache
+		// that has not seen the deletion yet.
+		if apierrors.IsNotFound(err) {
+			m.machineContext.Logger.Info("VM does not exist, nothing to do.")
+			return nil
+		}
 		return errors.Wrapf(err, "failed to delete VM")
 	}
 

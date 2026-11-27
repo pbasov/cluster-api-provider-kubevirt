@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
@@ -23,6 +24,9 @@ type MachineInterface interface {
 	Delete() error
 	// Exists checks if the VM has been provisioned already.
 	Exists() bool
+	// VMOwnerReference returns an owner reference to the VM, for objects in its namespace that
+	// must be garbage collected with it, or nil while the VM does not exist.
+	VMOwnerReference() *metav1.OwnerReference
 	// IsReady checks if the VM is ready
 	IsReady() bool
 	// IsLiveMigratable reports back the live-migratability state of the VM: Status, Reason and Message

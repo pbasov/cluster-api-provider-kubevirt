@@ -29,12 +29,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
@@ -355,6 +357,21 @@ var _ = Describe("With KubeVirt VM running", func() {
 
 		Expect(externalMachine.Delete()).To(Succeed())
 		validateVMNotExist(virtualMachine, fakeClient, machineContext)
+	})
+
+	It("Delete should be lenient if the VM is gone by the time it is deleted", func() {
+		// A cached client can still find a VM that is deleted already.
+		staleClient := fake.NewClientBuilder().WithScheme(testing.SetupScheme()).
+			WithObjects(cluster, kubevirtCluster, machine, kubevirtMachine, virtualMachineInstance, virtualMachine).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(_ gocontext.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "kubevirt.io", Resource: "virtualmachines"}, obj.GetName())
+				},
+			}).Build()
+		externalMachine, err := defaultTestMachine(machineContext, namespace, staleClient, fakeVMCommandExecutor, []byte{})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(externalMachine.Delete()).To(Succeed())
 	})
 
 	Context("test DrainNodeIfNeeded", func() {

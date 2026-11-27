@@ -27,6 +27,7 @@ import (
 	infrav1 "sigs.k8s.io/cluster-api-provider-kubevirt/api/v1alpha1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/capiv1beta1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
+	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ipam"
 )
 
 type CommandExecutor interface {
@@ -146,12 +147,17 @@ func buildVirtualMachineInstanceTemplate(ctx *context.MachineContext) *kubevirtv
 	cloudInitSecretName := *ctx.Machine.Spec.Bootstrap.DataSecretName + "-userdata"
 	userDataSecretRef := &corev1.LocalObjectReference{Name: cloudInitSecretName}
 
-	// The network data is copied into the same secret as the user data. KubeVirt mounts each
-	// reference into its own pod volume, so pointing both references at one secret is safe.
+	// The network data lives in a secret of its own per machine, not in the user data secret:
+	// machines may share a bootstrap data secret, and with it the user data secret, while each
+	// of them needs its own network data.
 	var networkDataSecretRef *corev1.LocalObjectReference
-	if ctx.KubevirtMachine.Spec.CloudInit.GetNetworkDataSecretRef() != nil || ctx.KubevirtMachine.Spec.CloudInit.GetNetworkData() != nil {
-		networkDataSecretRef = &corev1.LocalObjectReference{Name: cloudInitSecretName}
+	if HasNetworkData(ctx.KubevirtMachine) {
+		networkDataSecretRef = &corev1.LocalObjectReference{Name: NetworkDataSecretName(ctx.KubevirtMachine.Name)}
 	}
+
+	// The configuration rendered from spec.network matches the interfaces by MAC address, so
+	// the MAC addresses it expects are pinned on the interfaces.
+	pinInterfaceMACAddresses(template.Spec.Domain.Devices.Interfaces, ctx.StaticNetwork)
 
 	var cloudInitVolumeSource kubevirtv1.VolumeSource
 	if ctx.KubevirtMachine.Spec.CloudInit.GetDataSource() == infrav1.CloudInitDataSourceNoCloud {
@@ -191,4 +197,29 @@ func nodeRole(ctx *context.MachineContext) string {
 		return constants.ControlPlaneNodeRoleValue
 	}
 	return constants.WorkerNodeRoleValue
+}
+
+// NetworkDataSecretName returns the name of the secret, in the namespace of the virtual machine
+// in the infra cluster, that holds the cloud-init network data of a KubevirtMachine.
+func NetworkDataSecretName(kubevirtMachineName string) string {
+	return kubevirtMachineName + "-networkdata"
+}
+
+// HasNetworkData tells whether the virtual machine of a KubevirtMachine gets cloud-init network
+// data, from spec.cloudInit.networkData, spec.cloudInit.networkDataSecretRef or spec.network.
+func HasNetworkData(kubevirtMachine *infrav1.KubevirtMachine) bool {
+	cloudInit := kubevirtMachine.Spec.CloudInit
+	return cloudInit.GetNetworkData() != nil || cloudInit.GetNetworkDataSecretRef() != nil || kubevirtMachine.Spec.Network != nil
+}
+
+// pinInterfaceMACAddresses sets the MAC address of every interface that has a static
+// configuration and no MAC address of its own.
+func pinInterfaceMACAddresses(interfaces []kubevirtv1.Interface, staticNetwork []ipam.InterfaceConfig) {
+	for _, cfg := range staticNetwork {
+		for i := range interfaces {
+			if interfaces[i].Name == cfg.Name && interfaces[i].MacAddress == "" {
+				interfaces[i].MacAddress = cfg.MACAddress
+			}
+		}
+	}
 }

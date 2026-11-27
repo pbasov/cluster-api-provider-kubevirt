@@ -20,6 +20,7 @@ import (
 	gocontext "context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -28,9 +29,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/tools/events"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	ipamv1 "sigs.k8s.io/cluster-api/api/ipam/v1beta2"
 	capierrors "sigs.k8s.io/cluster-api/errors" //nolint:staticcheck // deprecated but no replacement yet
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -49,6 +53,7 @@ import (
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/capiv1beta1"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/context"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/infracluster"
+	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ipam"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/kubevirt"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/ssh"
 	"sigs.k8s.io/cluster-api-provider-kubevirt/pkg/workloadcluster"
@@ -61,20 +66,22 @@ type KubevirtMachineReconciler struct {
 	WorkloadCluster     workloadcluster.WorkloadCluster
 	MachineFactory      kubevirt.MachineFactory
 	ExcludedAnnotations annotationfilter.Filter
+	// IPAMEnabled is set when the KubevirtIPAM feature gate is enabled. Only then does the controller
+	// watch IPAddressClaims and provision machines with spec.network.
+	IPAMEnabled bool
+	// Recorder emits the events of the controller. It may be nil, in which case no event is emitted.
+	Recorder events.EventRecorder
 }
 
-type networkDataError struct {
-	err error
-}
-
-func (e *networkDataError) Error() string { return e.err.Error() }
-
-func (e *networkDataError) Unwrap() error { return e.err }
+// The rules for ipam.cluster.x-k8s.io are deliberately not generated into the manager role: they are
+// needed only with the KubevirtIPAM feature gate and come with the config/components/ipam
+// kustomize component.
 
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtmachines,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtmachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machines,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets;,verbs=get;list;watch;create;update;delete
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances;,verbs=get;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstancemigrations;,verbs=create
@@ -197,7 +204,7 @@ func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.
 
 	// Handle non-deleted machines
 	res, err := r.reconcileNormal(machineContext)
-	if err == nil && res.IsZero() {
+	if err == nil && res.IsZero() && !staticNetworkRefused(kubevirtMachine) {
 		// Update the providerID on the Node
 		// The ProviderID on the Node and the providerID on  the KubevirtMachine are used to set the NodeRef
 		// This code is needed here as long as there is no Kubevirt cloud provider setting the providerID in the node
@@ -208,6 +215,9 @@ func (r *KubevirtMachineReconciler) Reconcile(goctx gocontext.Context, req ctrl.
 }
 
 func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext) (res ctrl.Result, retErr error) {
+	if ctx.KubevirtMachine.Spec.Network != nil && !r.IPAMEnabled {
+		return r.reconcileIPAMDisabled(ctx)
+	}
 
 	// Make sure bootstrap data is available and populated.
 	if ctx.Machine.Spec.Bootstrap.DataSecretName == nil {
@@ -272,17 +282,21 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	if err := r.reconcileKubevirtBootstrapSecret(ctx, infraClusterClient, vmNamespace, clusterNodeSshKeys); err != nil {
-		reason := infrav1.WaitingForBootstrapDataReason
-		var networkErr *networkDataError
-		if errors.As(err, &networkErr) {
-			reason = infrav1.WaitingForNetworkDataReason
+	var staticNetworkData []byte
+	if ctx.KubevirtMachine.Spec.Network != nil {
+		networkData, res, err := r.reconcileStaticNetwork(ctx)
+		if networkData == nil {
+			return res, err
 		}
+		staticNetworkData = networkData
+	}
+
+	if err := r.reconcileKubevirtBootstrapSecret(ctx, infraClusterClient, vmNamespace, clusterNodeSshKeys); err != nil {
 		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
 			Type:    infrav1.VMProvisionedCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  reason,
-			Message: err.Error(),
+			Reason:  infrav1.WaitingForBootstrapDataReason,
+			Message: fmt.Sprintf("Failed to fetch bootstrap data: %v", err),
 		})
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to fetch kubevirt bootstrap secret")
 	}
@@ -291,6 +305,16 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	externalMachine, err := r.MachineFactory.NewMachine(ctx, infraClusterClient, r.Client, vmNamespace, clusterNodeSshKeys)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "failed to create helper for managing the externalMachine")
+	}
+
+	if err := r.reconcileKubevirtNetworkDataSecret(ctx, infraClusterClient, vmNamespace, staticNetworkData, externalMachine); err != nil {
+		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+			Type:    infrav1.VMProvisionedCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  infrav1.WaitingForNetworkDataReason,
+			Message: err.Error(),
+		})
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to prepare cloud-init network data")
 	}
 
 	isTerminal, terminalReason, err := externalMachine.IsTerminal()
@@ -480,6 +504,138 @@ func (r *KubevirtMachineReconciler) reconcileNormal(ctx *context.MachineContext)
 	return ctrl.Result{}, nil
 }
 
+// reconcileStaticNetwork claims the addresses of spec.network from their IPAM pools and, once all
+// of them are allocated, returns the guest network configuration rendered from them, which
+// reconcileKubevirtNetworkDataSecret hands to the guest the same way it hands over
+// spec.cloudInit.networkData. Without network data the machine must not be provisioned yet, and
+// the result and error are those to return from the reconcile.
+func (r *KubevirtMachineReconciler) reconcileStaticNetwork(ctx *context.MachineContext) ([]byte, ctrl.Result, error) {
+	result, err := ipam.ReconcileClaims(ctx, r.Client, ctx.KubevirtMachine, ctx.Cluster.Name)
+	if err != nil {
+		reason := infrav1.IPAddressClaimFailedReason
+		if ipam.IsInvalidAddress(err) {
+			reason = infrav1.IPAddressInvalidReason
+		}
+		changed := setIPAddressClaimed(ctx.KubevirtMachine, reason, err.Error())
+		if reason == infrav1.IPAddressInvalidReason {
+			setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, reason, "Not provisioned: the IP addresses of spec.network cannot be used")
+		} else {
+			setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, reason, "Waiting for the IP addresses of spec.network: claiming them failed")
+		}
+		if ipam.IsInvalidAddress(err) {
+			// Terminal: retrying cannot help. An allocated IPv6 address, or one without a usable
+			// prefix, stays what it is for as long as its claim exists, and the other causes need a
+			// change to the machine, which the KubevirtMachine watch picks up. Returning an error
+			// would only retry with backoff and feed the error metrics.
+			ctx.Logger.Info("Not provisioning the machine: unusable IP address or spec.network", "reason", err.Error())
+			if changed {
+				r.warningEvent(ctx.KubevirtMachine, infrav1.IPAddressInvalidReason, "ClaimIPAddresses", err.Error())
+			}
+			return nil, ctrl.Result{}, nil
+		}
+		return nil, ctrl.Result{}, err
+	}
+
+	if len(result.Pending) > 0 {
+		ctx.Logger.Info("Waiting for IP addresses to be allocated", "claims", result.Pending)
+		conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+			Type:   infrav1.IPAddressClaimedCondition,
+			Status: metav1.ConditionFalse,
+			Reason: infrav1.WaitingForIPAddressReason,
+			Message: "Waiting for IPAddressClaims: " + strings.Join(result.Pending, "; ") +
+				". If this persists, check that the pool has a free address and that its IPAM provider is running",
+		})
+		setVMNotProvisionedForStaticNetwork(ctx.KubevirtMachine, infrav1.WaitingForIPAddressReason, "Waiting for the IP addresses of spec.network to be allocated")
+		// The IPAddressClaim watch requeues as soon as an address is bound.
+		return nil, ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	networkData, err := ipam.RenderNetworkData(ctx.KubevirtMachine.Spec.CloudInit.GetDataSource(), result.Interfaces)
+	if err != nil {
+		return nil, ctrl.Result{}, errors.Wrap(err, "failed to render network data")
+	}
+
+	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+		Type:    infrav1.IPAddressClaimedCondition,
+		Status:  metav1.ConditionTrue,
+		Reason:  infrav1.IPAddressClaimedReason,
+		Message: "All IP addresses of spec.network are allocated",
+	})
+	ctx.StaticNetwork = result.Interfaces
+	return networkData, ctrl.Result{}, nil
+}
+
+// setVMNotProvisionedForStaticNetwork reports in VMProvisioned that the VM is not provisioned
+// because the addresses of spec.network are not there yet, or cannot be used, rather than leaving
+// an earlier wait in it, such as the one for bootstrap data. The details are in IPAddressClaimed. A
+// VM reported as provisioned already stays so: it exists, only its reconciliation is held back.
+func setVMNotProvisionedForStaticNetwork(kubevirtMachine *infrav1.KubevirtMachine, reason, message string) {
+	if conditions.IsTrue(kubevirtMachine, infrav1.VMProvisionedCondition) {
+		return
+	}
+	conditions.Set(kubevirtMachine, metav1.Condition{
+		Type:    infrav1.VMProvisionedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	})
+}
+
+// setIPAddressClaimed sets IPAddressClaimed to False with the reason and message, and reports
+// whether that changed the condition, so that a Warning event is emitted once per problem rather
+// than on every reconcile.
+func setIPAddressClaimed(kubevirtMachine *infrav1.KubevirtMachine, reason, message string) bool {
+	previous := conditions.Get(kubevirtMachine, infrav1.IPAddressClaimedCondition)
+	changed := previous == nil || previous.Status != metav1.ConditionFalse || previous.Reason != reason || previous.Message != message
+	conditions.Set(kubevirtMachine, metav1.Condition{
+		Type:    infrav1.IPAddressClaimedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	})
+	return changed
+}
+
+// staticNetworkRefused reports whether reconcileNormal stopped for good on spec.network: the
+// KubevirtIPAM feature gate is disabled, or an address or spec.network cannot be used. Such a
+// machine is not requeued: without a VM there is no Node whose providerID to update, and polling
+// for it would only retry every few seconds for nothing. It is reconciled again on any change to
+// it, its Machine or its claims, and when the manager restarts, for example with the gate enabled.
+func staticNetworkRefused(kubevirtMachine *infrav1.KubevirtMachine) bool {
+	cond := conditions.Get(kubevirtMachine, infrav1.IPAddressClaimedCondition)
+	return cond != nil && cond.Status == metav1.ConditionFalse &&
+		(cond.Reason == infrav1.IPAMFeatureDisabledReason || cond.Reason == infrav1.IPAddressInvalidReason)
+}
+
+// reconcileIPAMDisabled reports a KubevirtMachine with spec.network that cannot be provisioned
+// because the KubevirtIPAM feature gate is disabled. Nothing changes until the manager is restarted
+// with the gate, which reconciles every machine again, so the machine is not requeued (see
+// staticNetworkRefused).
+func (r *KubevirtMachineReconciler) reconcileIPAMDisabled(ctx *context.MachineContext) (ctrl.Result, error) {
+	const message = "spec.network is set, but the KubevirtIPAM feature gate of the KubeVirt infrastructure provider is disabled; " +
+		"enable it with --feature-gates=KubevirtIPAM=true, or replace the machine with one from a template without spec.network"
+	ctx.Logger.Info("Not provisioning the machine: " + message)
+	changed := setIPAddressClaimed(ctx.KubevirtMachine, infrav1.IPAMFeatureDisabledReason, message)
+	conditions.Set(ctx.KubevirtMachine, metav1.Condition{
+		Type:    infrav1.VMProvisionedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.IPAMFeatureDisabledReason,
+		Message: message,
+	})
+	if changed {
+		r.warningEvent(ctx.KubevirtMachine, infrav1.IPAMFeatureDisabledReason, "ClaimIPAddresses", message)
+	}
+	return ctrl.Result{}, nil
+}
+
+// warningEvent emits a Warning event about a KubevirtMachine, when the reconciler has a recorder.
+func (r *KubevirtMachineReconciler) warningEvent(kubevirtMachine *infrav1.KubevirtMachine, reason, action, note string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(kubevirtMachine, nil, corev1.EventTypeWarning, reason, action, "%s", note)
+}
+
 func machineHasKnownInternalIP(kubevirtMachine *infrav1.KubevirtMachine) bool {
 	for _, addr := range kubevirtMachine.Status.Addresses {
 		if addr.Type == clusterv1.MachineInternalIP && addr.Address != "" {
@@ -567,6 +723,11 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to delete bootstrap secret")
 	}
 
+	ctx.Logger.Info("Deleting VM network data secret...")
+	if err := r.deleteKubevirtNetworkDataSecret(ctx, infraClusterClient, vmNamespace); err != nil {
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to delete network data secret")
+	}
+
 	ctx.Logger.Info("Deleting VM...")
 	externalMachine, err := kubevirt.NewMachine(ctx, infraClusterClient, r.Client, vmNamespace, nil)
 	if err != nil {
@@ -577,6 +738,39 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		if err := externalMachine.Delete(); err != nil {
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to delete VM")
 		}
+	}
+
+	if r.IPAMEnabled {
+		// The claims are found by ownership rather than from spec.network, so that none is left
+		// behind for a spec.network changed before the field was made immutable.
+		claims, err := ipam.OwnedClaims(ctx, r.Client, ctx.KubevirtMachine)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, err
+		}
+		if len(claims) > 0 {
+			// Keep the claimed addresses until the guest that uses them is gone, so that a
+			// replacement machine can never be handed an address that is still in use. KubeVirt
+			// removes the VM only after its VMI, and the VMI only after its virt-launcher pods,
+			// so the VM being gone normally means that the guest is gone too. The VMI is checked
+			// as well for a VM deleted without its dependents (orphan propagation), which leaves
+			// the VMI, and with it the guest, running.
+			if externalMachine.Exists() {
+				ctx.Logger.Info("Waiting for the VM to be deleted before releasing its IP addresses...")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			if externalMachine.VMIExists() {
+				ctx.Logger.Info("Waiting for the VMI to be deleted before releasing its IP addresses...")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			ctx.Logger.Info("Releasing IP addresses...")
+			if err := ipam.ReleaseClaims(ctx, r.Client, claims); err != nil {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Wrap(err, "failed to release IP address claims")
+			}
+		}
+	} else if ctx.KubevirtMachine.Spec.Network != nil {
+		// Without the gate there is neither the RBAC nor, possibly, the API to touch claims. A
+		// machine admitted while the gate is disabled never had any.
+		ctx.Logger.Info("The KubevirtIPAM feature gate is disabled, not releasing IP address claims of spec.network")
 	}
 
 	// Machine is deleted so remove the finalizer.
@@ -591,7 +785,9 @@ func (r *KubevirtMachineReconciler) reconcileDelete(ctx *context.MachineContext)
 		Message: "KubevirtMachine deletion has started",
 	})
 	if err := ctx.PatchKubevirtMachine(patchHelper); err != nil {
-		if err = utilerrors.FilterOut(err, apierrors.IsNotFound); err != nil {
+		// The KubevirtMachine is gone once its last finalizer is removed, possibly already by an
+		// earlier reconcile that the cache has not caught up with yet.
+		if err = filterOutNotFoundError(err); err != nil {
 			return ctrl.Result{}, errors.Wrap(err, "failed to patch KubevirtMachine")
 		}
 	}
@@ -627,6 +823,12 @@ func (r *KubevirtMachineReconciler) SetupWithManager(goctx gocontext.Context, mg
 			handler.EnqueueRequestsFromMapFunc(clusterToKubevirtMachines),
 			builder.WithPredicates(predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(r.Scheme(), ctrl.LoggerFrom(goctx))),
 		)
+
+	if r.IPAMEnabled {
+		// Only with the gate: the watch needs the IPAddressClaim API and RBAC on it, and the
+		// manager does not start without them.
+		controllerBuilder = controllerBuilder.Owns(&ipamv1.IPAddressClaim{})
+	}
 
 	if !r.ExcludedAnnotations.IsEmpty() {
 		controllerBuilder = controllerBuilder.WithEventFilter(r.ExcludedAnnotations.Predicate())
@@ -716,11 +918,6 @@ func (r *KubevirtMachineReconciler) reconcileKubevirtBootstrapSecret(ctx *contex
 		}
 	}
 
-	networkData, err := r.getNetworkData(ctx)
-	if err != nil {
-		return err
-	}
-
 	newBootstrapDataSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      s.Name + "-userdata",
@@ -734,9 +931,6 @@ func (r *KubevirtMachineReconciler) reconcileKubevirtBootstrapSecret(ctx *contex
 		newBootstrapDataSecret.Type = clusterv1.ClusterSecretType
 		newBootstrapDataSecret.Data = map[string][]byte{
 			"userdata": value,
-		}
-		if len(networkData) > 0 {
-			newBootstrapDataSecret.Data["networkdata"] = networkData
 		}
 
 		return nil
@@ -756,12 +950,92 @@ func (r *KubevirtMachineReconciler) reconcileKubevirtBootstrapSecret(ctx *contex
 	return nil
 }
 
-// getNetworkData returns the cloud-init network configuration referenced by the KubevirtMachine's
-// networkDataSecretRef. It returns nil when no reference is set.
+// reconcileKubevirtNetworkDataSecret writes the cloud-init network data of the machine, if it has
+// any, to a secret of its own in the infra cluster, in the namespace of the virtual machine,
+// named by kubevirt.NetworkDataSecretName. staticNetworkData is the configuration rendered from
+// spec.network; when it is nil, the network data comes from spec.cloudInit.networkData or
+// spec.cloudInit.networkDataSecretRef.
+//
+// The network data is not written to the "<bootstrap data secret>-userdata" secret: machines can
+// share a bootstrap data secret, for example all the machines of a MachineDeployment with some
+// bootstrap providers, and with it that copy, while each of them needs its own network data.
+//
+// The secret is owned by the VM, once the VM exists, so that it is garbage collected with the VM
+// when the VM goes without CAPK, for example when the VMs of a cluster are deleted in the infra
+// cluster directly. The KubevirtMachine cannot be its owner: owner references do not cross
+// namespaces or clusters, and the secret lives next to the VM, which can be in another namespace
+// or, with an external infra cluster, in another cluster. The deletion of the KubevirtMachine
+// still deletes the secret explicitly.
+func (r *KubevirtMachineReconciler) reconcileKubevirtNetworkDataSecret(ctx *context.MachineContext, infraClusterClient client.Client, vmNamespace string, staticNetworkData []byte, vm kubevirt.MachineInterface) error {
+	networkData := staticNetworkData
+	if networkData == nil {
+		var err error
+		if networkData, err = r.getNetworkData(ctx); err != nil {
+			return err
+		}
+		if networkData == nil {
+			return nil
+		}
+	}
+
+	networkDataSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubevirt.NetworkDataSecretName(ctx.KubevirtMachine.Name),
+			Namespace: vmNamespace,
+		},
+	}
+	res, err := controllerutil.CreateOrUpdate(ctx, infraClusterClient, networkDataSecret, func() error {
+		if networkDataSecret.Labels == nil {
+			networkDataSecret.Labels = map[string]string{}
+		}
+		networkDataSecret.Labels[clusterv1.ClusterNameLabel] = ctx.Cluster.Name
+		networkDataSecret.OwnerReferences = withVMOwner(networkDataSecret.OwnerReferences, vm.VMOwnerReference())
+		networkDataSecret.Type = clusterv1.ClusterSecretType
+		networkDataSecret.Data = map[string][]byte{
+			"networkdata": networkData,
+		}
+
+		return nil
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to write network data secret %s/%s in the infra cluster", vmNamespace, networkDataSecret.Name)
+	}
+
+	switch res {
+	case controllerutil.OperationResultCreated:
+		ctx.Logger.Info("Created KubeVirt cloud-init network data secret")
+	case controllerutil.OperationResultUpdated:
+		ctx.Logger.Info("Updated KubeVirt cloud-init network data secret")
+	}
+
+	return nil
+}
+
+// withVMOwner returns the owner references with owner as the only VirtualMachine among them, or with
+// none when owner is nil. The reference to a VM that is gone, and that this machine is about to
+// create again, is dropped, so that the garbage collector does not delete the secret the new VM
+// needs.
+func withVMOwner(refs []metav1.OwnerReference, owner *metav1.OwnerReference) []metav1.OwnerReference {
+	var result []metav1.OwnerReference
+	for _, ref := range refs {
+		gv, err := schema.ParseGroupVersion(ref.APIVersion)
+		if err == nil && gv.Group == kubevirtv1.VirtualMachineGroupVersionKind.Group && ref.Kind == kubevirtv1.VirtualMachineGroupVersionKind.Kind {
+			continue
+		}
+		result = append(result, ref)
+	}
+	if owner != nil {
+		result = append(result, *owner)
+	}
+	return result
+}
+
+// getNetworkData returns the cloud-init network data of spec.cloudInit: the inline networkData, or
+// the content of the secret networkDataSecretRef references. It returns nil when neither is set.
 func (r *KubevirtMachineReconciler) getNetworkData(ctx *context.MachineContext) ([]byte, error) {
 	if data := ctx.KubevirtMachine.Spec.CloudInit.GetNetworkData(); data != nil {
 		if len(*data) == 0 {
-			return nil, &networkDataError{err: errors.New("error retrieving network data: inline networkData is empty")}
+			return nil, errors.New("error retrieving network data: inline networkData is empty")
 		}
 		return []byte(*data), nil
 	}
@@ -774,20 +1048,36 @@ func (r *KubevirtMachineReconciler) getNetworkData(ctx *context.MachineContext) 
 	key := client.ObjectKey{Namespace: ctx.KubevirtMachine.GetNamespace(), Name: ref.Name}
 	s := &corev1.Secret{}
 	if err := r.Get(ctx, key, s); err != nil {
-		return nil, &networkDataError{err: errors.Wrapf(err, "failed to retrieve network data secret %s for KubevirtMachine %s/%s", key, ctx.KubevirtMachine.GetNamespace(), ctx.KubevirtMachine.GetName())}
+		return nil, errors.Wrapf(err, "failed to retrieve network data secret %s for KubevirtMachine %s/%s", key, ctx.KubevirtMachine.GetNamespace(), ctx.KubevirtMachine.GetName())
 	}
 
 	// Both spellings are accepted, matching the keys KubeVirt itself looks up in a network data secret.
 	for _, dataKey := range []string{"networkdata", "networkData"} {
 		if networkData, ok := s.Data[dataKey]; ok {
 			if len(networkData) == 0 {
-				return nil, &networkDataError{err: errors.Errorf("error retrieving network data: secret %s has an empty %s value", key, dataKey)}
+				return nil, errors.Errorf("error retrieving network data: secret %s has an empty %s value", key, dataKey)
 			}
 			return networkData, nil
 		}
 	}
 
-	return nil, &networkDataError{err: errors.Errorf("error retrieving network data: secret %s is missing the networkdata key", key)}
+	return nil, errors.Errorf("error retrieving network data: secret %s is missing the networkdata key", key)
+}
+
+// deleteKubevirtNetworkDataSecret deletes the cloud-init network data secret of the machine from
+// the infra cluster, if there is one.
+func (r *KubevirtMachineReconciler) deleteKubevirtNetworkDataSecret(ctx *context.MachineContext, infraClusterClient client.Client, vmNamespace string) error {
+	networkDataSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubevirt.NetworkDataSecretName(ctx.KubevirtMachine.Name),
+			Namespace: vmNamespace,
+		},
+	}
+	if err := infraClusterClient.Delete(ctx, networkDataSecret); err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "failed to delete network data secret %s/%s in the infra cluster", vmNamespace, networkDataSecret.Name)
+	}
+
+	return nil
 }
 
 // deleteKubevirtBootstrapSecret deletes bootstrap cloud-init secret for KubeVirt virtual machines
@@ -805,7 +1095,9 @@ func (r *KubevirtMachineReconciler) deleteKubevirtBootstrapSecret(ctx *context.M
 		return nil
 	}
 
-	if err := infraClusterClient.Delete(ctx, bootstrapDataSecret); err != nil {
+	// Machines sharing the bootstrap data secret share this secret too, and one of them may have
+	// deleted it since the read.
+	if err := infraClusterClient.Delete(ctx, bootstrapDataSecret); err != nil && !apierrors.IsNotFound(err) {
 		return errors.Wrapf(err, "failed to delete kubevirt bootstrap secret for cluster")
 	}
 

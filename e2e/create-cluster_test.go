@@ -622,7 +622,7 @@ var _ = Describe("CreateCluster", func() {
 			By("Waiting on kubevirt machines to bootstrap")
 			waitForBootstrappedMachines(ctx)
 
-			By("checking network data shares the bootstrap secret")
+			By("checking every machine has a network data secret of its own")
 			vmList := &kubevirtv1.VirtualMachineList{}
 			Expect(k8sclient.List(ctx, vmList, client.InNamespace(namespace))).To(Succeed())
 			Expect(vmList.Items).To(HaveLen(2))
@@ -646,12 +646,13 @@ var _ = Describe("CreateCluster", func() {
 				}
 				Expect(userDataRef).ToNot(BeNil())
 				Expect(networkDataRef).ToNot(BeNil())
-				Expect(networkDataRef.Name).To(Equal(userDataRef.Name))
+				Expect(networkDataRef.Name).To(Equal(vmList.Items[i].Name + "-networkdata"))
+				Expect(networkDataRef.Name).ToNot(Equal(userDataRef.Name))
 
-				cloudInitSecret := &corev1.Secret{}
-				secretKey := client.ObjectKey{Namespace: namespace, Name: userDataRef.Name}
-				Expect(k8sclient.Get(ctx, secretKey, cloudInitSecret)).To(Succeed())
-				Expect(cloudInitSecret.Data["networkdata"]).To(Equal([]byte(networkDataByMAC[interfaces[0].MacAddress])))
+				networkDataSecret := &corev1.Secret{}
+				secretKey := client.ObjectKey{Namespace: namespace, Name: networkDataRef.Name}
+				Expect(k8sclient.Get(ctx, secretKey, networkDataSecret)).To(Succeed())
+				Expect(networkDataSecret.Data["networkdata"]).To(Equal([]byte(networkDataByMAC[interfaces[0].MacAddress])))
 			}
 
 			By("verifying every guest applied the supplied DNS server")

@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -112,12 +111,28 @@ func cloudInitNetworkDataManifests(manifests []byte, namespace string, dataSourc
 	return []byte(strings.Join(documents, "\n---\n")), secrets, networkDataByMAC, nil
 }
 
-func TestCloudInitNetworkDataManifests(t *testing.T) {
-	_, sourceFile, _, ok := goruntime.Caller(0)
-	if !ok {
-		t.Fatal("could not locate test source file")
+// clusterTemplatePath finds templates/cluster-template.yaml relative to the working directory: the
+// repository root when the e2e binary runs (as for the clusterctl calls of the other specs), the
+// e2e package directory under "go test". The path of the source file compiled into the binary is
+// not used, since it exists only on the host that built it.
+func clusterTemplatePath() (string, error) {
+	candidates := []string{
+		filepath.Join("templates", "cluster-template.yaml"),
+		filepath.Join("..", "templates", "cluster-template.yaml"),
 	}
-	templatePath := filepath.Join(filepath.Dir(sourceFile), "../templates/cluster-template.yaml")
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("cluster template not found at %v; run from the repository root or the e2e directory", candidates)
+}
+
+func TestCloudInitNetworkDataManifests(t *testing.T) {
+	templatePath, err := clusterTemplatePath()
+	if err != nil {
+		t.Fatal(err)
+	}
 	manifests, err := os.ReadFile(templatePath)
 	if err != nil {
 		t.Fatal(err)
